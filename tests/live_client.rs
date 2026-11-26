@@ -423,3 +423,92 @@ fn cloud_drafts_survive_device_changes_and_diverging_edits() -> io::Result<()> {
     assert_eq!(after.0[0].body, "From A");
     fs::remove_dir_all(root)
 }
+
+#[test]
+fn idle_session_fetches_and_retains_the_verified_board_offline() -> io::Result<()> {
+    use std::time::{Duration, Instant};
+    use synod::session::{
+        protocol::{Reply, Request},
+        transport::{Client, host},
+    };
+    let root = std::env::temp_dir().join(format!("synod-idle-sync-{}", std::process::id()));
+    fs::create_dir(&root)?;
+    let config = root.join("client.json");
+    let roots = bootstrap::initialize(&config, &root.join("state"), &root.join("work"))?;
+    let remote = root.join("remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .output()?
+            .status
+            .success()
+    );
+    let url = remote.to_str().unwrap();
+    let team: NewTeam = serde_json::from_str(include_str!("fixtures/v1/team/team.json"))?;
+    let source = root.join("source");
+    operations::publish_initial(
+        &source,
+        url,
+        &team,
+        &operations::freeze_initial("member-alice")?,
+    )?;
+    let mut cfg = ClientConfig::read(&config)?;
+    cfg.fields.insert(
+        "profile".into(),
+        serde_json::to_value(Profile {
+            team: team.clone(),
+            human: "member-chen".into(),
+            assistant: String::new(),
+            remote: url.into(),
+        })?,
+    );
+    cfg.save(&config)?;
+    let handle = std::thread::spawn(move || host(config));
+    fn wait(mut ready: impl FnMut() -> bool) -> io::Result<()> {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            if Instant::now() >= end {
+                return Err(io::Error::other("Background sync timed out"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+    wait(|| roots.state.join("runtime/endpoint.json").exists() || handle.is_finished())?;
+    if handle.is_finished() {
+        return handle.join().unwrap();
+    }
+    let mut client = Client::connect(&roots.state)?;
+    client.request(Request::SetInterval(1u32.try_into().unwrap()))?;
+    let intent = operations::FrozenSend::new(
+        "member-alice",
+        team.id(),
+        synod::application::letters::Draft {
+            title: "idle arrival".into(),
+            to: "member-chen".into(),
+            ..Default::default()
+        },
+    )?;
+    operations::send_letter(&source, &team, url, &intent)?;
+    let cache = roots
+        .state
+        .join("teams")
+        .join(team.id())
+        .join("verified-board.json");
+    wait(|| fs::read_to_string(&cache).is_ok_and(|s| s.contains("idle arrival")))?;
+    fs::rename(&remote, root.join("offline.git"))?;
+    wait(|| {
+        matches!(
+            client.request(Request::SyncStatus),
+            Ok(Reply::SyncStatus(Some(_)))
+        )
+    })?;
+    let Reply::Published(letters) = client.request(Request::Published)? else {
+        panic!("missing board")
+    };
+    assert!(letters[0].unread);
+    drop(client);
+    handle.join().unwrap()?;
+    fs::remove_dir_all(root)
+}

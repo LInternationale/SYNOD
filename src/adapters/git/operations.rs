@@ -66,7 +66,7 @@ pub fn freeze_initial(actor: &str) -> io::Result<InitialCommit> {
 
 pub(super) fn git(dir: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
+    cmd.arg("-C").arg(dir).arg("--literal-pathspecs").args(args);
     run(cmd)
 }
 
@@ -187,6 +187,31 @@ pub fn published_letters(
 ) -> io::Result<Vec<crate::application::letters::PublishedLetter>> {
     published_snapshot(root, team, remote).map(|(_, letters)| letters)
 }
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct VerifiedBoard {
+    pub remote: String,
+    pub revision: String,
+    pub team: NewTeam,
+    pub letters: Vec<crate::application::letters::PublishedLetter>,
+}
+pub(crate) fn cached_board(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+) -> io::Result<Option<VerifiedBoard>> {
+    let path = root
+        .join("teams")
+        .join(team.id())
+        .join("verified-board.json");
+    match std::fs::File::open(path) {
+        Ok(f) => Ok(serde_json::from_reader::<_, VerifiedBoard>(f)
+            .ok()
+            .filter(|b| b.remote == remote && b.team.id() == team.id())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn published_snapshot(
     root: &Path,
     team: &NewTeam,
@@ -213,6 +238,15 @@ pub fn published_snapshot(
         &cache,
         &["fetch", "--no-tags", "--", remote, "refs/heads/main"],
     )?;
+    let revision = String::from_utf8(git(&cache, &["rev-parse", "FETCH_HEAD"])?)
+        .map_err(io::Error::other)?
+        .trim()
+        .to_owned();
+    if let Some(board) = cached_board(root, team, remote)?
+        && board.revision == revision
+    {
+        return Ok((board.team, board.letters));
+    }
     let actual: NewTeam = serde_json::from_slice(&git(&cache, &["show", "FETCH_HEAD:team.json"])?)?;
     actual.validate()?;
     if actual.id() != team.id() {
@@ -316,7 +350,23 @@ pub fn published_snapshot(
         });
     }
     crate::application::letters::project_progress(&mut result)?;
-    Ok((actual, result))
+    let board = VerifiedBoard {
+        remote: remote.into(),
+        revision,
+        team: actual,
+        letters: result,
+    };
+    git(
+        &cache,
+        &["update-ref", "refs/synod/verified-main", &board.revision],
+    )?;
+    let dir = root.join("teams").join(team.id());
+    let temp = dir.join("verified-board.tmp");
+    let file = std::fs::File::create(&temp)?;
+    serde_json::to_writer(&file, &board)?;
+    file.sync_all()?;
+    std::fs::rename(temp, dir.join("verified-board.json"))?;
+    Ok((board.team, board.letters))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -582,7 +632,7 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     Err(io::Error::other("Remote branch advanced; retry this send"))
 }
 
-fn copy_workspace(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn copy_workspace(from: &Path, to: &Path) -> io::Result<()> {
     use std::fs;
     if !fs::symlink_metadata(from)?.is_dir() {
         return Err(io::Error::other("Select an ordinary workspace directory"));
@@ -591,7 +641,9 @@ fn copy_workspace(from: &Path, to: &Path) -> io::Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name.to_string_lossy().eq_ignore_ascii_case(".git") {
+        if name.to_string_lossy().eq_ignore_ascii_case(".git")
+            || name.to_string_lossy().starts_with(".synod-sync-")
+        {
             return Err(io::Error::other("Nested Git metadata in workspace"));
         }
         let target = to.join(name);
@@ -614,8 +666,9 @@ fn work_msg(kind: &str, team: &str, actor: &str, space: &str) -> io::Result<Stri
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_nanos();
+    let space = toml::Value::String(space.into());
     let msg = format!(
-        "kind = \"{kind}\"\n\nschema_version = 2\nteam_id = \"{team}\"\noperation_id = \"work-{unique}-{}\"\nactor_id = \"{actor}\"\noccurred_at = {timestamp}\n\n[target]\nspace_id = \"{space}\"\n",
+        "kind = \"{kind}\"\n\nschema_version = 2\nteam_id = \"{team}\"\noperation_id = \"work-{unique}-{}\"\nactor_id = \"{actor}\"\noccurred_at = {timestamp}\n\n[target]\nspace_id = {space}\n",
         std::process::id()
     );
     super::commit_message::decode(&msg).map_err(|e| io::Error::other(format!("{e:?}")))?;
@@ -658,17 +711,19 @@ pub fn workspace_action(
     use crate::session::protocol::{WorkAction as A, WorkResult as R};
     use std::fs;
     team.validate()?;
-    if !team.human(actor) || !team.spaces().iter().any(|(id, _)| *id == space) {
+    if !team.human(actor) || !crate::adapters::local::tags::load(state, team)?.contains_key(space) {
         return Err(io::Error::other(
             "Select a human identity and a team workspace",
         ));
     }
     let base = state.join("teams").join(team.id());
-    let area = base.join("spaces").join(space).join(actor);
+    let key = crate::adapters::local::tags::key(space);
+    let local = crate::adapters::local::tags::directory(work, space)?;
+    let area = base.join("spaces").join(&key).join(actor);
     fs::create_dir_all(&area)?;
     let marker = area.join("merge-attempt");
     let prefix = format!("workspace/{space}");
-    let personal = format!("refs/heads/work/{actor}/{space}");
+    let personal = format!("refs/heads/work/{actor}/{key}");
     let attempts = base.join("worktrees");
     let publish = |dir: &Path| -> io::Result<R> {
         check_staged_scope(dir, space)?;
@@ -792,7 +847,7 @@ pub fn workspace_action(
             },
         ],
     )?;
-    let sub = dir.join(&prefix);
+    let sub = crate::adapters::local::tags::directory(&dir, &prefix)?;
     let parent = dir.join("workspace");
     if parent.exists() && !fs::symlink_metadata(&parent)?.is_dir() {
         return Err(io::Error::other("Invalid remote workspace root"));
@@ -803,7 +858,7 @@ pub fn workspace_action(
         }
         fs::remove_dir_all(&sub)?;
     }
-    copy_workspace(&work.join(space), &sub)?;
+    copy_workspace(&local, &sub)?;
     if !git(&dir, &["ls-files", "-z", "--", &prefix])?.is_empty()
         || fs::read_dir(&sub)?.next().is_some()
     {

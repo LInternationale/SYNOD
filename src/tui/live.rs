@@ -269,7 +269,16 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
     let mut board = Bulletin::default();
     let mut published = Vec::new();
     let mut filter = "all".to_string();
-    loop {
+    let mut last_error = None;
+    'refresh: loop {
+        if let Reply::SyncStatus(error) = client.request(Request::SyncStatus)? {
+            if error != last_error
+                && let Some(e) = &error
+            {
+                notice(t, color, &format!("后台同步未完成：{e}"))?;
+            }
+            last_error = error;
+        }
         let Reply::Drafts(drafts) = client.request(Request::Drafts)? else {
             return Err(io::Error::other("Missing draft list"));
         };
@@ -316,6 +325,9 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
         let rows = BoardRows::new(if filter == "all" { &draft_views } else { &[] }, &views);
         let action = loop {
             let area = t.draw(|f| board.render_with_theme(f, &rows, color))?.area;
+            if !event::poll(std::time::Duration::from_secs(2))? {
+                continue 'refresh;
+            }
             let e = input()?;
             if let Some(action) = board.handle(e, area, &rows) {
                 break action;
@@ -363,7 +375,11 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 }
             }
             BoardAction::Preferences => {
-                let mut menu = Form::new("偏好", vec![], &["设置主题色", "身份", "添加成员"]);
+                let mut menu = Form::new(
+                    "偏好",
+                    vec![],
+                    &["设置主题色", "身份", "添加成员", "同步间隔", "子工作区标签"],
+                );
                 match menu.interact(t, color, "")? {
                     Action::Button(0) => {
                         let mut form = ThemeForm::new(color);
@@ -379,14 +395,32 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                         }
                     }
                     Action::Button(1) => identities(t, &mut client, color)?,
-                    Action::Button(_) => registration(t, &mut client, color, false)?,
+                    Action::Button(2) => registration(t, &mut client, color, false)?,
+                    Action::Button(3) => {
+                        if let Reply::Interval(seconds) = client.request(Request::Interval)? {
+                            let mut form = Form::new(
+                                "后台同步间隔",
+                                vec![field("检查间隔（秒）", seconds.to_string())],
+                                &["应用设置"],
+                            );
+                            let mut error = String::new();
+                            while let Action::Button(_) = form.interact(t, color, &error)? {
+                                match form.val(0).parse() {
+                                    Ok(value) => {
+                                        client.request(Request::SetInterval(value))?;
+                                        break;
+                                    }
+                                    Err(_) => error = "请填写大于零的整数秒数".into(),
+                                }
+                            }
+                        }
+                    }
+                    Action::Button(_) => workspace(t, &mut client, color, &roots.work, true)?,
                     Action::Back => {}
                 }
             }
             BoardAction::Workspace => {
-                if let Reply::Files(names) = client.request(Request::Workspace)? {
-                    workspace(t, &mut client, color, &roots.work, &names)?;
-                }
+                workspace(t, &mut client, color, &roots.work, false)?;
             }
         }
     }
@@ -496,25 +530,19 @@ fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<()> {
 fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> io::Result<bool> {
     use crate::adapters::github::{RepositoryRequest, Visibility};
     let mut owner = Form::new(
-        "新建队伍 · 1/5 · 选择存放位置",
+        "新建队伍 · 1/4 · 选择存放位置",
         vec![field("GitHub 用户名或组织名", "")],
         &["下一步"],
     );
     owner.help = "队伍的信件和文件会保存在 GitHub 上. 填写你的 GitHub 用户名，或你可以创建仓库的组织名. 比如个人主页是 github.com/alice，就填 alice. ";
     let mut name = Form::new(
-        "新建队伍 · 2/5 · 给队伍仓库起名",
+        "新建队伍 · 2/4 · 给队伍仓库起名",
         vec![field("仓库名", "")],
         &["下一步"],
     );
     name.help = "仓库是队伍在 GitHub 上存放数据的地方. 名称会成为网址的一部分，例如 contest-team. 可用英文字母、数字、短横线、下划线和点. ";
-    let mut spaces = Form::new(
-        "新建队伍 · 3/5 · 划分共享工作区",
-        vec![field("工作区名称", "")],
-        &["下一步"],
-    );
-    spaces.help = "哪些工作需要分开保存、提交和同步？例如填「代码，论文」就有两个工作区. 用逗号隔开，暂时不需要可以留空. ";
     let mut access = Form::new(
-        "新建队伍 · 4/5 · 谁能查看队伍数据",
+        "新建队伍 · 3/4 · 谁能查看队伍数据",
         vec![],
         &["仅有权限的人", "任何人"],
     );
@@ -523,15 +551,8 @@ fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> i
     let mut public = false;
     let mut error = String::new();
     loop {
-        let names: Vec<String> = spaces.fields[0]
-            .value
-            .split([',', '，'])
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-            .collect();
         let overview = format!(
-            "队伍数据将存放在 github.com/{}/{}\n可查看数据的人：{}\n共享工作区：{}\n创建后，再添加本机要使用的人类和 AI 身份. ",
+            "队伍数据将存放在 github.com/{}/{}\n可查看数据的人：{}\n创建后，再添加本机要使用的人类和 AI 身份. ",
             owner.val(0),
             name.val(0),
             if public {
@@ -539,20 +560,14 @@ fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> i
             } else {
                 "仅有仓库访问权限的人"
             },
-            if names.is_empty() {
-                "暂不设置".into()
-            } else {
-                names.join("、")
-            }
         );
         let action = match step {
             0 => owner.interact(t, color, &error)?,
             1 => name.interact(t, color, &error)?,
-            2 => spaces.interact(t, color, &error)?,
-            3 => access.interact(t, color, &error)?,
+            2 => access.interact(t, color, &error)?,
             _ => {
                 let mut review =
-                    Form::new("新建队伍 · 5/5 · 核对并创建", vec![], &["确认创建队伍"]);
+                    Form::new("新建队伍 · 4/4 · 核对并创建", vec![], &["确认创建队伍"]);
                 review.help = &overview;
                 review.interact(t, color, &error)?
             }
@@ -576,11 +591,13 @@ fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> i
                 error = "请填写可以用在仓库网址里的名称，例如 contest-team. ".into();
                 continue;
             }
-            3 => public = choice == 1,
-            4 => {
-                let manifest =
-                    NewTeam::empty(&format!("team-{}", name.val(0).replace('.', "-")), names)
-                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+            2 => public = choice == 1,
+            3 => {
+                let manifest = NewTeam::empty(
+                    &format!("team-{}", name.val(0).replace('.', "-")),
+                    Vec::new(),
+                )
+                .map_err(|e| io::Error::other(format!("{e:?}")))?;
                 match client.request(Request::Create {
                     owner: owner.val(0),
                     name: name.val(0),
@@ -729,91 +746,200 @@ fn workspace(
     client: &mut Client,
     color: ThemeColor,
     root: &Path,
-    names: &[String],
+    tags_only: bool,
 ) -> io::Result<()> {
-    let mut focus = 0;
-    let mut offset = 0usize;
+    use crate::adapters::git::workspace_sync::Mode;
+    let mut focus = 0usize;
+    let mut selected = String::new();
     let mut status = String::new();
+    let mut refresh = true;
+    let mut names = Vec::new();
+    let mut tags = std::collections::BTreeMap::new();
+    let mut modes = std::collections::BTreeMap::new();
+    let labels = if tags_only {
+        vec!["切换标签"]
+    } else {
+        vec!["打开工作目录", "保存工作", "提交工作", "获取更新"]
+    };
     loop {
-        let mut hits = Vec::new();
+        if refresh {
+            if let Reply::Files(files) = client.request(Request::Workspace)? {
+                names = files;
+            }
+            if let Reply::Tags(list) = client.request(Request::Tags)? {
+                tags = list;
+            }
+            modes.clear();
+            for tag in tags.keys() {
+                if !names.contains(tag) {
+                    names.push(tag.clone());
+                }
+                if let Ok(Reply::SpaceSync(p)) = client.request(Request::SpaceSync {
+                    space: tag.clone(),
+                    action: SyncAction::Preview,
+                }) {
+                    modes.insert(tag.clone(), p);
+                }
+            }
+            names.sort();
+            if !names.contains(&selected) {
+                selected = names.first().cloned().unwrap_or_default();
+            }
+            refresh = false;
+        }
+        let index = names.iter().position(|s| *s == selected).unwrap_or(0);
         let mut bounds = Vec::new();
+        let mut rows = Vec::new();
         t.draw(|f| {
-            let [tree, bar, message] = Layout::vertical([
+            let block = super::page(
+                if tags_only {
+                    "子工作区标签"
+                } else {
+                    "工作区"
+                },
+                color,
+            );
+            let inner = block.inner(f.area());
+            f.render_widget(block, f.area());
+            let [tree, bar, footer] = Layout::vertical([
                 Constraint::Min(0),
                 Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(2),
             ])
-            .areas(f.area());
+            .areas(inner);
             bounds.push((0, tree));
-            let height = usize::from(tree.height.saturating_sub(2));
-            offset = offset.min(names.len().saturating_sub(height));
-            let lines = names
+            let count = usize::from(tree.height);
+            for (n, name) in names
                 .iter()
-                .skip(offset)
-                .take(height)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n");
-            f.render_widget(
-                Paragraph::new(lines).block(super::page("工作区", color)),
-                tree,
-            );
-            let buttons = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(bar);
-            for (i, (label, rect)) in ["打开工作目录", "保存工作", "提交工作"]
+                .enumerate()
+                .skip((index + 1).saturating_sub(count))
+                .take(count)
+            {
+                let mode = modes.get(name);
+                let label = if tags.contains_key(name) {
+                    let m = if mode.is_some_and(|p| p.mode == Mode::WhenClean) {
+                        "无修改时自动同步"
+                    } else {
+                        "仅手动"
+                    };
+                    let update = match mode {
+                        Some(p) if !p.paths.is_empty() && p.dirty => " · 有更新，本地有修改",
+                        Some(p) if !p.paths.is_empty() => " · 有更新",
+                        _ => "",
+                    };
+                    format!("{name}/  [{m}{update}]")
+                } else if root.join(name).is_dir() {
+                    format!("{name}/")
+                } else {
+                    name.clone()
+                };
+                let rect = Rect::new(tree.x, tree.y + rows.len() as u16, tree.width, 1);
+                let row = Paragraph::new(label);
+                f.render_widget(
+                    if focus == 0 && n == index {
+                        row.style(color.highlight())
+                    } else {
+                        row
+                    },
+                    rect,
+                );
+                rows.push((n, rect));
+            }
+            for (i, (label, rect)) in labels
                 .iter()
-                .zip(buttons.iter())
+                .zip(
+                    Layout::horizontal(vec![
+                        Constraint::Ratio(1, labels.len() as u32);
+                        labels.len()
+                    ])
+                    .split(bar)
+                    .iter(),
+                )
                 .enumerate()
             {
-                let item = Paragraph::new(*label).centered();
+                let w = Paragraph::new(*label).centered();
                 f.render_widget(
                     if focus == i + 1 {
-                        item.style(color.highlight())
+                        w.style(color.highlight())
                     } else {
-                        item
+                        w
                     },
                     *rect,
                 );
-                hits.push(*rect);
                 bounds.push((i + 1, *rect));
             }
-            f.render_widget(Paragraph::new(status.as_str()), message);
+            let help = if tags_only {
+                "选中文件夹，按空格添加或移除子工作区标签"
+            } else {
+                "选中子工作区，按空格切换同步模式"
+            };
+            f.render_widget(
+                Paragraph::new(if status.is_empty() { help } else { &status }),
+                footer,
+            );
         })?;
-        let activate = match input()? {
+        if !event::poll(std::time::Duration::from_secs(2))? {
+            refresh = true;
+            continue;
+        }
+        let toggle = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(()),
-                KeyCode::Up if focus == 0 && offset > 0 => {
-                    offset -= 1;
-                    false
+                KeyCode::Up if focus == 0 && index > 0 => {
+                    selected = names[index - 1].clone();
+                    continue;
                 }
-                KeyCode::Down
-                    if focus == 0
-                        && offset + usize::from(t.size()?.height.saturating_sub(4))
-                            < names.len() =>
+                KeyCode::Down if focus == 0 && index + 1 < names.len() => {
+                    selected = names[index + 1].clone();
+                    continue;
+                }
+                KeyCode::Char(' ') if focus == 0 => true,
+                KeyCode::Enter if focus > 0 => tags_only,
+                code if let Some(next) =
+                    super::focus_step(code, focus, labels.len() + 1, &bounds) =>
                 {
-                    offset += 1;
-                    false
-                }
-                code if let Some(next) = super::focus_step(code, focus, 4, &bounds) => {
                     focus = next;
-                    false
+                    continue;
                 }
-                KeyCode::Enter => focus > 0,
-                _ => false,
+                _ => continue,
             },
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(i) = hits
-                    .iter()
-                    .position(|r| r.contains(Position::new(m.column, m.row)))
-                {
-                    focus = i + 1;
-                    true
-                } else {
-                    false
+                let pos = Position::new(m.column, m.row);
+                if let Some((n, _)) = rows.iter().find(|(_, r)| r.contains(pos)) {
+                    selected = names[*n].clone();
+                    focus = 0;
+                    continue;
                 }
+                let Some((button, _)) = bounds.iter().skip(1).find(|(_, r)| r.contains(pos)) else {
+                    continue;
+                };
+                focus = *button;
+                tags_only
             }
-            _ => false,
+            _ => continue,
         };
-        if !activate {
+        refresh = true;
+        if toggle {
+            let request = if tags_only {
+                Request::ToggleTag(selected.clone())
+            } else if let Some(p) = modes.get(&selected) {
+                Request::SpaceSync {
+                    space: selected.clone(),
+                    action: SyncAction::SetMode(if p.mode == Mode::Manual {
+                        Mode::WhenClean
+                    } else {
+                        Mode::Manual
+                    }),
+                }
+            } else {
+                status = "请选择已标记的子工作区".into();
+                continue;
+            };
+            status = client
+                .request(request)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             continue;
         }
         if focus == 1 {
@@ -829,16 +955,50 @@ fn workspace(
             }
             continue;
         }
-        let Reply::Team(Some(profile)) = client.request(Request::Profile)? else {
-            return Err(io::Error::other("Missing profile"));
-        };
-        let spaces = profile.team.spaces();
-        let Some(selection) = choose(t, color, "选择子工作区", &spaces, &[], false)? else {
+        let space = &selected;
+        if !tags.contains_key(space) {
+            status = "请先选中一个子工作区目录".into();
             continue;
-        };
-        let Some(space) = selection.first() else {
+        }
+        if focus == 4 {
+            let response = client.request(Request::SpaceSync {
+                space: space.clone(),
+                action: SyncAction::RefreshPreview,
+            });
+            let plan = match response {
+                Ok(Reply::SpaceSync(p)) => p,
+                Err(e) => {
+                    status = e.to_string();
+                    continue;
+                }
+                _ => return Err(io::Error::other("Missing workspace preview")),
+            };
+            if plan.paths.is_empty() {
+                status = "已是最新版本".into();
+                continue;
+            }
+            if !plan.conflicts.is_empty() {
+                notice(
+                    t,
+                    color,
+                    &format!("以下文件两边都有修改：\n{}", plan.conflicts.join("\n")),
+                )?;
+                continue;
+            }
+            let mut form = Form::new("获取更新", vec![], &["取消", "应用更新"]);
+            let paths = plan.paths.join("\n");
+            form.help = &paths;
+            if let Action::Button(1) = form.interact(t, color, "")? {
+                status = match client.request(Request::SpaceSync {
+                    space: space.clone(),
+                    action: SyncAction::Apply(plan),
+                }) {
+                    Ok(_) => "已应用更新".into(),
+                    Err(e) => e.to_string(),
+                };
+            }
             continue;
-        };
+        }
         let mut action = if focus == 2 {
             WorkAction::Save
         } else {
@@ -902,8 +1062,8 @@ fn workspace(
                 }
                 Ok(Reply::Work(result)) => {
                     status = match result {
-                        WorkResult::Saved => "已保存到个人分支",
-                        WorkResult::Published => "已提交到 main",
+                        WorkResult::Saved => "已保存工作",
+                        WorkResult::Published => "已提交到共享工作区",
                         WorkResult::Deferred => "已取消本次提交",
                         _ => unreachable!(),
                     }

@@ -76,27 +76,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             }
             let (manifest, mut letters) =
                 operations::published_snapshot(&roots.state, &team.team, &team.remote)?;
-            let actor = entry.actor(&team);
-            let receipts = roots
-                .state
-                .join("teams")
-                .join(team.team.id())
-                .join("notices")
-                .join(actor);
-            for letter in &mut letters {
-                let event = letter
-                    .events
-                    .first()
-                    .ok_or_else(|| io::Error::other("Missing send event"))?;
-                let directed = !actor.is_empty()
-                    && (letter.to == actor || letter.cc.iter().any(|c| c == actor));
-                letter.unread = directed && !receipts.join(&event.event_id).exists();
-                if letter.unread && matches!(&request,Request::Read(id) if id==&letter.id) {
-                    fs::create_dir_all(&receipts)?;
-                    fs::write(receipts.join(&event.event_id), b"read")?;
-                    letter.unread = false;
-                }
-            }
+            let reply = board_reply(&roots.state, &team, request, entry, &mut letters)?;
             if serde_json::to_value(&manifest)? != serde_json::to_value(&team.team)? {
                 save_profile(
                     config,
@@ -107,14 +87,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     },
                 )?;
             }
-            if let Request::Read(id) = request {
-                return letters
-                    .into_iter()
-                    .find(|l| l.id == id)
-                    .map(Reply::Letter)
-                    .ok_or_else(|| io::Error::other("Unknown published letter"));
-            }
-            Ok(Reply::Published(letters))
+            Ok(reply)
         }
         Request::Profile => Ok(Reply::Team(current)),
         Request::Create {
@@ -343,6 +316,12 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                 .join("drafts")
                 .join(entry.actor(&team));
             fs::create_dir_all(&base)?;
+            if !matches!(request, Request::Drafts) {
+                match fs::remove_file(base.join("current-list.json")) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
             if let Request::Send(reference) = request {
                 if !reference
                     .strip_prefix("letter-local-")
@@ -403,7 +382,11 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             }
             let mut local = Vec::new();
             for entry in fs::read_dir(&base)? {
-                let copy = entry?.path().join("primary");
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let copy = entry.path().join("primary");
                 if copy.join("sent").exists() {
                     continue;
                 }
@@ -449,11 +432,43 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     }
                 }
             }
-            Ok(Reply::Drafts(local.into_iter().map(|(d, _)| d).collect()))
+            let drafts: Vec<_> = local.into_iter().map(|(d, _)| d).collect();
+            write_local(&base.join("current-list.json"), &drafts)?;
+            Ok(Reply::Drafts(drafts))
+        }
+        Request::Tags | Request::ToggleTag(_) => {
+            let p = current.ok_or_else(|| io::Error::other("Team required"))?;
+            let list = match request {
+                Request::ToggleTag(name) => {
+                    crate::adapters::local::tags::toggle(&roots.state, &roots.work, &p.team, &name)?
+                }
+                _ => crate::adapters::local::tags::load(&roots.state, &p.team)?,
+            };
+            Ok(Reply::Tags(list))
+        }
+        Request::SpaceSync { space, action } => {
+            let p = current.ok_or_else(|| io::Error::other("Team required"))?;
+            let sync = crate::adapters::git::workspace_sync::Space::open(
+                &roots.state,
+                &roots.work,
+                &p.team,
+                &space,
+            )?;
+            if matches!(action, SyncAction::RefreshPreview | SyncAction::Apply(_)) {
+                operations::published_snapshot(&roots.state, &p.team, &p.remote)?;
+            }
+            match action {
+                SyncAction::SetMode(mode) => sync.set_mode(mode)?,
+                SyncAction::Apply(plan) => {
+                    return Ok(Reply::SpaceSync(sync.synchronize(Some(&plan))?));
+                }
+                SyncAction::Preview | SyncAction::RefreshPreview => {}
+            }
+            Ok(Reply::SpaceSync(sync.preview()?))
         }
         Request::WorkspaceAction { space, action } => {
             let profile = current.ok_or_else(|| io::Error::other("Team required"))?;
-            Ok(Reply::Work(operations::workspace_action(
+            let result = operations::workspace_action(
                 &roots.state,
                 &roots.work,
                 &profile.team,
@@ -461,7 +476,19 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                 &profile.human,
                 &space,
                 action,
-            )?))
+            )?;
+            let sync = crate::adapters::git::workspace_sync::Space::open(
+                &roots.state,
+                &roots.work,
+                &profile.team,
+                &space,
+            )?;
+            match result {
+                WorkResult::Saved | WorkResult::Conflict => sync.mark_saved()?,
+                WorkResult::Published => sync.mark_published()?,
+                _ => {}
+            }
+            Ok(Reply::Work(result))
         }
         Request::Workspace => {
             let mut names = Vec::new();
@@ -469,6 +496,12 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                 for item in fs::read_dir(dir)? {
                     let item = item?;
                     let path = item.path();
+                    let name = item.file_name();
+                    if name.to_string_lossy().eq_ignore_ascii_case(".git")
+                        || name.to_string_lossy().starts_with(".synod-sync-")
+                    {
+                        continue;
+                    }
                     names.push(
                         path.strip_prefix(root)
                             .map_err(io::Error::other)?
@@ -487,6 +520,224 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
         }
         _ => Err(io::Error::other("Unexpected request")),
     }
+}
+fn board_reply(
+    state: &Path,
+    team: &Profile,
+    request: Request,
+    entry: Entry,
+    letters: &mut Vec<PublishedLetter>,
+) -> io::Result<Reply> {
+    let actor = entry.actor(&team);
+    let receipts = state
+        .join("teams")
+        .join(team.team.id())
+        .join("notices")
+        .join(actor);
+    for letter in letters.iter_mut() {
+        let event = letter
+            .events
+            .first()
+            .ok_or_else(|| io::Error::other("Missing send event"))?;
+        let directed =
+            !actor.is_empty() && (letter.to == actor || letter.cc.iter().any(|c| c == actor));
+        letter.unread = directed && !receipts.join(&event.event_id).exists();
+        if letter.unread && matches!(&request,Request::Read(id) if id==&letter.id) {
+            fs::create_dir_all(&receipts)?;
+            fs::write(receipts.join(&event.event_id), b"read")?;
+            letter.unread = false;
+        }
+    }
+
+    let letters = std::mem::take(letters);
+    if let Request::Read(id) = request {
+        return letters
+            .into_iter()
+            .find(|l| l.id == id)
+            .map(Reply::Letter)
+            .ok_or_else(|| io::Error::other("Unknown published letter"));
+    }
+    Ok(Reply::Published(letters))
+}
+
+pub(super) fn cached_query(
+    file: &Path,
+    request: &Request,
+    entry: Entry,
+) -> io::Result<Option<Reply>> {
+    if !matches!(
+        request,
+        Request::Published | Request::Read(_) | Request::Profile | Request::Drafts
+    ) {
+        return Ok(None);
+    }
+    let cfg = ClientConfig::read(file)?;
+    let Some(p) = profile(&cfg)? else {
+        return Ok(None);
+    };
+    if matches!(entry, Entry::Assistant) && !entry.bound(&p) {
+        return Err(io::Error::other(
+            "Select an active assistant identity in preferences",
+        ));
+    }
+    if matches!(request, Request::Profile) {
+        return Ok(Some(Reply::Team(Some(p))));
+    }
+    let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
+    if matches!(request, Request::Drafts) {
+        let path = roots
+            .state
+            .join("teams")
+            .join(p.team.id())
+            .join("drafts")
+            .join(entry.actor(&p))
+            .join("current-list.json");
+        return Ok(read_optional::<Vec<Draft>>(&path)?.map(Reply::Drafts));
+    }
+    let Some(mut board) = operations::cached_board(&roots.state, &p.team, &p.remote)? else {
+        return Ok(None);
+    };
+    let query = match request {
+        Request::Read(id) => Request::Read(id.clone()),
+        _ => Request::Published,
+    };
+    Ok(Some(board_reply(
+        &roots.state,
+        &p,
+        query,
+        entry,
+        &mut board.letters,
+    )?))
+}
+
+pub(super) fn synchronize(file: &Path) -> io::Result<()> {
+    let config = ClientConfig::read(file)?;
+    let Some(p) = profile(&config)? else {
+        return Ok(());
+    };
+    if config.pending_team.is_some() {
+        return Ok(());
+    }
+    perform_as(file, Request::Published, Entry::Human)?;
+    let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
+    let mut result = retry_outbox(&roots.state, &p);
+    for (actor, _) in p.team.roster() {
+        if actor == p.human || actor == p.assistant {
+            continue;
+        }
+        let dir = roots
+            .state
+            .join("teams")
+            .join(p.team.id())
+            .join("drafts")
+            .join(actor);
+        if !dir.is_dir() {
+            continue;
+        }
+        for item in fs::read_dir(dir)? {
+            let item = item?;
+            if !item.file_type()?.is_dir() {
+                continue;
+            }
+            let copy = item.path().join("primary");
+            if let Some(intent) =
+                read_optional::<operations::FrozenSend>(&copy.join("save-pending.json"))?
+                && intent.team == p.team.id()
+                && intent.actor == actor
+            {
+                result =
+                    result.and(finish_cloud_save(&roots.state, &p, &copy, &intent).map(|_| ()));
+            }
+        }
+    }
+    for entry in [Entry::Human, Entry::Assistant] {
+        if entry.bound(&p) {
+            result = result.and(perform_as(file, Request::Drafts, entry).map(|_| ()));
+        }
+    }
+    for space in crate::adapters::local::tags::load(&roots.state, &p.team)?.keys() {
+        let sync = crate::adapters::git::workspace_sync::Space::open(
+            &roots.state,
+            &roots.work,
+            &p.team,
+            space,
+        );
+        result = result.and(sync.and_then(|s| s.synchronize(None).map(|_| ())));
+    }
+    result
+}
+fn retry_outbox(state: &Path, profile: &Profile) -> io::Result<()> {
+    use crate::application::letters::TaskChange;
+    let base = state.join("teams").join(profile.team.id());
+    let items = match fs::read_dir(base.join("outbox")) {
+        Ok(items) => items,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut pending = items.collect::<io::Result<Vec<_>>>()?;
+    pending.sort_by_key(|e| e.file_name());
+    fn retry(item: fs::DirEntry, base: &Path, state: &Path, profile: &Profile) -> io::Result<()> {
+        if !item.file_type()?.is_dir() {
+            return Ok(());
+        }
+        let dir = item.path();
+        let path = dir.join("intent.json");
+        if dir.join("confirmed").exists() || !path.exists() {
+            return Ok(());
+        }
+        let key = item.file_name();
+        let key = key
+            .to_str()
+            .ok_or_else(|| io::Error::other("Invalid outbox identity"))?;
+        if key.starts_with("task-") {
+            let (remote, letter, change, intent): (
+                String,
+                String,
+                TaskChange,
+                operations::InitialCommit,
+            ) = serde_json::from_slice(&fs::read(&path)?)?;
+            if remote != profile.remote || intent.operation != key {
+                return Ok(());
+            }
+            operations::change_task(state, &profile.team, &remote, &letter, &intent, &change)?;
+        } else {
+            let intent: operations::FrozenSend = serde_json::from_slice(&fs::read(&path)?)?;
+            if intent.team != profile.team.id()
+                || intent.key != key
+                || !(profile.team.human(&intent.actor) || profile.team.assistant(&intent.actor))
+            {
+                return Ok(());
+            }
+            let Some(suffix) = intent.draft.reference.strip_prefix("letter-local-") else {
+                return Ok(());
+            };
+            if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+                return Ok(());
+            }
+            let copy = base
+                .join("drafts")
+                .join(&intent.actor)
+                .join(&intent.draft.reference)
+                .join("primary");
+            let Some(active) = read_optional::<operations::FrozenSend>(&copy.join("send.json"))?
+            else {
+                return Ok(());
+            };
+            if active.key != intent.key {
+                return Ok(());
+            }
+            operations::send_letter(state, &profile.team, &profile.remote, &intent)?;
+            fs::write(copy.join("sent"), &intent.key)?;
+            fs::remove_file(copy.join("send.json"))?;
+        }
+        fs::remove_file(path)?;
+        fs::remove_dir(dir)
+    }
+    let mut result = Ok(());
+    for item in pending {
+        result = result.and(retry(item, &base, state, profile));
+    }
+    result
 }
 fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::File::open(path) {

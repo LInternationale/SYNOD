@@ -94,7 +94,14 @@ impl Client {
     }
 }
 
-fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String) -> io::Result<()> {
+fn connection(
+    stream: UnixStream,
+    file: Arc<PathBuf>,
+    writer: Arc<Mutex<()>>,
+    generation: String,
+    wake: mpsc::Sender<()>,
+    sync_error: Arc<Mutex<Option<String>>>,
+) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     let entry = match read(&mut reader)? {
         Request::Hello(VERSION, g, entry) if g == generation => entry,
@@ -110,7 +117,18 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
         let request = read(&mut reader)?;
         let close = matches!(request, Request::Close);
         let result = (|| -> io::Result<Reply> {
-            let file = file
+            if matches!(request, Request::SyncStatus) {
+                return Ok(Reply::SyncStatus(
+                    sync_error
+                        .lock()
+                        .map_err(|_| io::Error::other("Sync status unavailable"))?
+                        .clone(),
+                ));
+            }
+            if let Some(reply) = super::host::cached_query(&file, &request, entry)? {
+                return Ok(reply);
+            }
+            let _guard = writer
                 .lock()
                 .map_err(|_| io::Error::other("Settings lock unavailable"))?;
             match request {
@@ -120,6 +138,17 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
                     config.fields.insert("custom_theme".into(), true.into());
                     config.save(&file)?;
                     Ok(Reply::Color(rgb))
+                }
+                Request::SyncStatus => unreachable!(),
+                Request::Interval => Ok(Reply::Interval(
+                    ClientConfig::read(&file)?.sync_interval_seconds,
+                )),
+                Request::SetInterval(value) => {
+                    let mut config = ClientConfig::read(&file)?;
+                    config.sync_interval_seconds = value;
+                    config.save(&file)?;
+                    let _ = wake.send(());
+                    Ok(Reply::Ready)
                 }
                 Request::Theme => Ok(Reply::Color(ClientConfig::read(&file)?.theme_rgb)),
                 Request::Close => Ok(Reply::Ready),
@@ -135,6 +164,9 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
                 | Request::Published
                 | Request::Drafts
                 | Request::SaveDraft(_)
+                | Request::Tags
+                | Request::ToggleTag(_)
+                | Request::SpaceSync { .. }
                 | Request::WorkspaceAction { .. }
                 | Request::Workspace) => super::host::perform_as(&file, other, entry),
                 Request::Hello(..) => Err(io::Error::other("Session already connected")),
@@ -202,7 +234,32 @@ pub fn host(file: PathBuf) -> io::Result<()> {
     fs::write(&tmp, serde_json::to_vec(&endpoint)?)?;
     fs::rename(tmp, runtime.join("endpoint.json"))?;
     listener.set_nonblocking(true)?;
-    let file = Arc::new(Mutex::new(file));
+    let file = Arc::new(file);
+    let writer = Arc::new(Mutex::new(()));
+    let (stop, stop_rx) = mpsc::channel::<()>();
+    let worker_file = file.clone();
+    let worker_lock = writer.clone();
+    let sync_error = Arc::new(Mutex::new(None));
+    let worker_error = sync_error.clone();
+    let sync_worker = thread::spawn(move || {
+        loop {
+            if let Ok(_guard) = worker_lock.lock() {
+                let error = super::host::synchronize(&worker_file)
+                    .err()
+                    .map(|e| e.to_string());
+                if let Ok(mut last) = worker_error.lock() {
+                    *last = error;
+                }
+            }
+            let wait = ClientConfig::read(&worker_file)
+                .map(|c| Duration::from_secs(c.sync_interval_seconds.get().into()))
+                .unwrap_or(Duration::from_secs(30));
+            match stop_rx.recv_timeout(wait) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+        }
+    });
     let (done, rx) = mpsc::channel();
     let mut workers = Vec::new();
     let start = Instant::now();
@@ -214,9 +271,12 @@ pub fn host(file: PathBuf) -> io::Result<()> {
                 connected = true;
                 let file = file.clone();
                 let done = done.clone();
+                let writer = writer.clone();
+                let wake = stop.clone();
+                let error = sync_error.clone();
                 let generation = generation.clone();
                 workers.push(thread::spawn(move || {
-                    let _ = connection(stream, file, generation);
+                    let _ = connection(stream, file, writer, generation, wake, error);
                     let _ = done.send(());
                 }));
             }
@@ -230,6 +290,10 @@ pub fn host(file: PathBuf) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
+    drop(stop);
+    sync_worker
+        .join()
+        .map_err(|_| io::Error::other("Sync worker stopped unexpectedly"))?;
     drop(listener);
     fs::remove_file(runtime.join("endpoint.json"))?;
     fs::remove_file(path)?;

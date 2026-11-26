@@ -1,5 +1,8 @@
 # SYNOD 初始设计蓝图
 
+当前实现按本机标签划分子工作区. 标签位于队伍对应的本机状态目录，旧版名册中的空间作为初始标签. 新建队伍在引导结束后从偏好配置标签. 工作目录保持普通文件夹结构，按相对路径对应队伍仓库中的共享文件. 设备的默认检查间隔为 30 秒，可在偏好调整. [同步设计与验证](implementation.md#session-driven-synchronization)
+
+
 当前队伍 Git 协议为 v2. 操作信息写进 commit message，文件版本由 Git 保存. 下文涉及事件文件的约定仅用于读取 v1 仓库. 正文待办和子任务按当前进度规则汇总. [当前 Git 协议](git-commit-format.md) · [进度规则](implementation.md#inline-checklist-revision-and-independent-review)
 
 

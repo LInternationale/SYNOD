@@ -91,7 +91,7 @@ pub(super) fn replay(dir: &Path, team: &str) -> io::Result<BTreeMap<String, Vec<
             }
             Operation::WorkspacePublished(t) => {
                 let prefix = format!("workspace/{}/", t.space_id);
-                if !safe(&t.space_id)
+                if !crate::adapters::local::tags::valid(&t.space_id)
                     || parents.is_empty()
                     || parents.len() > 2
                     || changes

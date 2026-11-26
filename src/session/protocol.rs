@@ -1,9 +1,16 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Hello(u8, String, Entry),
+    SyncStatus,
+    Interval,
+    SetInterval(std::num::NonZeroU32),
+    SpaceSync {
+        space: String,
+        action: SyncAction,
+    },
     Theme,
     ApplyTheme([u8; 3]),
     Profile,
@@ -37,11 +44,16 @@ pub enum Request {
         space: String,
         action: WorkAction,
     },
+    Tags,
+    ToggleTag(String),
     Workspace,
     Close,
 }
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
+    SyncStatus(Option<String>),
+    Interval(std::num::NonZeroU32),
+    SpaceSync(crate::adapters::git::workspace_sync::Preview),
     Letter(PublishedLetter),
     Published(Vec<PublishedLetter>),
     Work(WorkResult),
@@ -50,6 +62,7 @@ pub enum Reply {
     Team(Option<Profile>),
     Drafts(Vec<Draft>),
     Saved(Draft, Option<String>),
+    Tags(crate::adapters::local::tags::Tags),
     Files(Vec<String>),
     Color([u8; 3]),
     Failure(String),
@@ -102,4 +115,12 @@ impl Entry {
             }
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum SyncAction {
+    Preview,
+    RefreshPreview,
+    SetMode(crate::adapters::git::workspace_sync::Mode),
+    Apply(crate::adapters::git::workspace_sync::Preview),
 }
