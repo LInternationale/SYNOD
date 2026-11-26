@@ -65,7 +65,7 @@ impl ClientConfig {
     pub fn read(path: &Path) -> io::Result<Self> {
         match File::open(path) {
             Ok(file) => {
-                let mut config: Self = serde_json::from_reader(file)?;
+                let mut config: Self = serde_json::from_reader(io::BufReader::new(file))?;
                 if config.theme_rgb == [70, 93, 112]
                     && config.fields.get("custom_theme").and_then(|v| v.as_bool()) != Some(true)
                 {
@@ -76,6 +76,28 @@ impl ClientConfig {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }
+    }
+
+    pub(crate) fn update(path: &Path, edit: impl FnOnce(&mut Self)) -> io::Result<()> {
+        Self::try_update(path, |current| {
+            edit(current);
+            Ok(())
+        })
+    }
+    pub(crate) fn try_update<T>(
+        path: &Path,
+        edit: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("settings.lock"))?;
+        lock.lock()?;
+        let mut config = Self::read(path)?;
+        let result = edit(&mut config)?;
+        config.save(path)?;
+        Ok(result)
     }
 
     /// Atomically install the complete settings document. The caller owns serialization of writers.

@@ -111,21 +111,50 @@ pub fn discover(
         &dir,
         &["fetch", "--no-tags", "--", remote, "refs/heads/main"],
     )?;
-    let manifest: NewTeam = serde_json::from_slice(&git(&dir, &["show", "FETCH_HEAD:team.json"])?)?;
+    discover_at(&dir, team, remote, actor, "FETCH_HEAD")
+}
+
+pub(crate) fn discover_verified(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    actor: &str,
+) -> io::Result<(Vec<Draft>, std::collections::BTreeSet<(String, String)>)> {
+    if !team.human(actor) && !team.assistant(actor) {
+        return Err(io::Error::other("Unknown draft author"));
+    }
+    discover_at(
+        &repository(root, team)?,
+        team,
+        remote,
+        actor,
+        "refs/synod/verified-main",
+    )
+}
+
+fn discover_at(
+    dir: &Path,
+    team: &NewTeam,
+    remote: &str,
+    actor: &str,
+    revision: &str,
+) -> io::Result<(Vec<Draft>, std::collections::BTreeSet<(String, String)>)> {
+    let main = decode(git(dir, &["rev-parse", revision])?)?
+        .trim()
+        .to_owned();
+    let manifest: NewTeam =
+        serde_json::from_slice(&git(dir, &["show", &format!("{main}:team.json")])?)?;
     if manifest.id() != team.id() {
         return Err(io::Error::other("Remote team mismatch"));
     }
-    let main = decode(git(&dir, &["rev-parse", "FETCH_HEAD"])?)?
-        .trim()
-        .to_owned();
     let mut sealed = std::collections::BTreeSet::new();
     let published = decode(
         git(
             &dir,
-            &["ls-tree", "-d", "--name-only", "FETCH_HEAD:letters"],
+            &["ls-tree", "-d", "--name-only", &format!("{main}:letters")],
         )
         .or_else(|e| {
-            if git(&dir, &["ls-tree", "FETCH_HEAD", "letters"])?.is_empty() {
+            if git(&dir, &["ls-tree", &main, "letters"])?.is_empty() {
                 Ok(vec![])
             } else {
                 Err(e)

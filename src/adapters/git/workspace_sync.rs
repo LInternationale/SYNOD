@@ -169,6 +169,13 @@ pub struct Space {
     local: PathBuf,
     name: String,
 }
+fn read_mode(area: &Path) -> io::Result<Mode> {
+    match fs::File::open(area.join("mode.json")) {
+        Ok(f) => Ok(serde_json::from_reader(f)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Mode::Manual),
+        Err(e) => Err(e),
+    }
+}
 impl Space {
     pub fn open(state: &Path, work: &Path, team: &NewTeam, space: &str) -> io::Result<Self> {
         team.validate()?;
@@ -189,11 +196,7 @@ impl Space {
         })
     }
     pub fn mode(&self) -> io::Result<Mode> {
-        match fs::File::open(self.area.join("mode.json")) {
-            Ok(f) => Ok(serde_json::from_reader(f)?),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Mode::Manual),
-            Err(e) => Err(e),
-        }
+        read_mode(&self.area)
     }
     pub fn mark_saved(&self) -> io::Result<()> {
         fs::write(self.area.join("pending-personal"), [])
@@ -205,6 +208,7 @@ impl Space {
         }
     }
     pub fn set_mode(&self, mode: Mode) -> io::Result<()> {
+        let _guard = crate::adapters::local::tags::lock(&self.area)?;
         atomic(&self.area.join("mode.json"), &mode)
     }
     fn baseline(&self) -> String {
@@ -231,6 +235,38 @@ impl Space {
                 .trim()
                 .into(),
         )
+    }
+    pub(crate) fn sync_and_cache(&self, manual: Option<&Preview>) -> io::Result<Preview> {
+        let plan = self.synchronize(manual)?;
+        atomic(&self.area.join("last-comparison.json"), &plan)?;
+        Ok(plan)
+    }
+    pub(crate) fn status(state: &Path, team: &NewTeam, name: &str) -> io::Result<Preview> {
+        if !crate::adapters::local::tags::valid(name) {
+            return Err(invalid());
+        }
+        let area = state
+            .join("teams")
+            .join(team.id())
+            .join("spaces")
+            .join(crate::adapters::local::tags::key(name))
+            .join("sync");
+        let mode = read_mode(&area)?;
+        match fs::read(area.join("last-comparison.json")) {
+            Ok(bytes) => {
+                let mut p: Preview = serde_json::from_slice(&bytes)?;
+                p.mode = mode;
+                Ok(p)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Preview {
+                mode,
+                revision: String::new(),
+                paths: vec![],
+                conflicts: vec![],
+                dirty: false,
+            }),
+            Err(e) => Err(e),
+        }
     }
     pub fn preview(&self) -> io::Result<Preview> {
         let rev = self.revision()?;

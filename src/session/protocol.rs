@@ -1,6 +1,6 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Hello(u8, String, Entry),
@@ -38,6 +38,8 @@ pub enum Request {
     },
     Read(String),
     Published,
+    Board,
+    OpenDraft(String),
     Drafts,
     SaveDraft(Draft),
     WorkspaceAction {
@@ -56,6 +58,12 @@ pub enum Reply {
     SpaceSync(crate::adapters::git::workspace_sync::Preview),
     Letter(PublishedLetter),
     Published(Vec<PublishedLetter>),
+    Board {
+        actor: String,
+        letters: Vec<LetterRow>,
+        drafts: Vec<DraftRow>,
+    },
+    Draft(Draft),
     Work(WorkResult),
     Pending(bool),
     Ready,
@@ -119,8 +127,23 @@ impl Entry {
 
 #[derive(Serialize, Deserialize)]
 pub enum SyncAction {
-    Preview,
+    Status,
     RefreshPreview,
     SetMode(crate::adapters::git::workspace_sync::Mode),
     Apply(crate::adapters::git::workspace_sync::Preview),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DraftRow {
+    pub reference: String,
+    pub title: String,
+}
+#[derive(Serialize, Deserialize)]
+pub struct LetterRow {
+    pub id: String,
+    pub title: String,
+    pub author: String,
+    pub to: String,
+    pub cc: Vec<String>,
+    pub unread: bool,
 }

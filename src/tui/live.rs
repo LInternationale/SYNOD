@@ -267,7 +267,6 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
         identities(t, &mut client, color)?
     }
     let mut board = Bulletin::default();
-    let mut published = Vec::new();
     let mut filter = "all".to_string();
     let mut last_error = None;
     'refresh: loop {
@@ -279,8 +278,13 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             }
             last_error = error;
         }
-        let Reply::Drafts(drafts) = client.request(Request::Drafts)? else {
-            return Err(io::Error::other("Missing draft list"));
+        let Reply::Board {
+            actor,
+            letters: published,
+            drafts,
+        } = client.request(Request::Board)?
+        else {
+            return Err(io::Error::other("Missing local bulletin"));
         };
         let draft_views: Vec<_> = drafts
             .iter()
@@ -289,21 +293,6 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 title: &d.title,
             })
             .collect();
-        match client.request(Request::Published) {
-            Ok(Reply::Published(letters)) => published = letters,
-            Err(e) => {
-                notice(t, color, &format!("公告板同步失败：{e}"))?;
-            }
-            _ => return Err(io::Error::other("Missing publication list")),
-        };
-        let actor = if filter == "all" {
-            String::new()
-        } else {
-            match client.request(Request::Profile)? {
-                Reply::Team(Some(p)) => p.human,
-                _ => String::new(),
-            }
-        };
         let labels: std::collections::HashMap<_, _> = published
             .iter()
             .filter(|l| l.unread)
@@ -319,7 +308,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             .map(|l| super::LetterView {
                 id: &l.id,
                 title: labels.get(&l.id).map_or(l.title.as_str(), String::as_str),
-                body: &l.body,
+                body: "",
             })
             .collect();
         let rows = BoardRows::new(if filter == "all" { &draft_views } else { &[] }, &views);
@@ -364,14 +353,21 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                         t,
                         &mut client,
                         color,
-                        Draft::replying_to(letter, &published),
+                        Draft::reply_to(
+                            &letter.id,
+                            &letter.title,
+                            &letter.author,
+                            published.iter().map(|l| l.title.as_str()),
+                        ),
                         &published,
                     )?
                 }
             }
             BoardAction::OpenDraft(reference) => {
-                if let Some(d) = drafts.iter().find(|d| d.reference == reference) {
-                    compose(t, &mut client, color, d.clone(), &published)?
+                match client.request(Request::OpenDraft(reference.into())) {
+                    Ok(Reply::Draft(d)) => compose(t, &mut client, color, d, &published)?,
+                    Err(e) => notice(t, color, &e.to_string())?,
+                    _ => return Err(io::Error::other("Missing local draft")),
                 }
             }
             BoardAction::Preferences => {
@@ -621,7 +617,7 @@ fn compose(
     client: &mut Client,
     c: ThemeColor,
     mut saved: Draft,
-    board: &[PublishedLetter],
+    board: &[LetterRow],
 ) -> io::Result<()> {
     let Reply::Team(Some(profile)) = client.request(Request::Profile)? else {
         return Err(io::Error::other("Missing team roster"));
@@ -776,7 +772,7 @@ fn workspace(
                 }
                 if let Ok(Reply::SpaceSync(p)) = client.request(Request::SpaceSync {
                     space: tag.clone(),
-                    action: SyncAction::Preview,
+                    action: SyncAction::Status,
                 }) {
                     modes.insert(tag.clone(), p);
                 }
@@ -1178,7 +1174,7 @@ fn task_detail(
     client: &mut Client,
     color: ThemeColor,
     initial: &PublishedLetter,
-    board: &[PublishedLetter],
+    board: &[LetterRow],
 ) -> io::Result<()> {
     use crate::application::letters::TaskChange;
     let mut letter = initial.clone();

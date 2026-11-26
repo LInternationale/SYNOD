@@ -107,17 +107,31 @@ pub fn checklist(body: &str) -> Vec<ChecklistItem> {
 
 impl Draft {
     pub fn replying_to(letter: &PublishedLetter, board: &[PublishedLetter]) -> Self {
-        let base = format!("Re: {}", letter.title);
+        Self::reply_to(
+            &letter.id,
+            &letter.title,
+            &letter.author,
+            board.iter().map(|l| l.title.as_str()),
+        )
+    }
+    pub(crate) fn reply_to<'a>(
+        id: &str,
+        subject: &str,
+        author: &str,
+        titles: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let titles: std::collections::HashSet<_> = titles.map(str::trim).collect();
+        let base = format!("Re: {subject}");
         let mut title = base.clone();
         let mut suffix = 2;
-        while board.iter().any(|item| item.title.trim() == title.trim()) {
+        while titles.contains(title.trim()) {
             title = format!("{base} - {suffix}");
             suffix += 1;
         }
         Self {
             title,
-            to: letter.author.clone(),
-            references: vec![letter.id.clone()],
+            to: author.into(),
+            references: vec![id.into()],
             ..Self::default()
         }
     }

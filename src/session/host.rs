@@ -31,7 +31,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
         config
             .fields
             .insert("profile".into(), serde_json::to_value(p)?);
-        config.save(file)?;
+        save_session(&config, file, false)?;
     }
     if matches!(entry, Entry::Assistant) && !current.as_ref().is_some_and(|p| entry.bound(p)) {
         return Err(io::Error::other(
@@ -78,13 +78,14 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                 operations::published_snapshot(&roots.state, &team.team, &team.remote)?;
             let reply = board_reply(&roots.state, &team, request, entry, &mut letters)?;
             if serde_json::to_value(&manifest)? != serde_json::to_value(&team.team)? {
-                save_profile(
+                store_profile(
                     config,
                     file,
                     Profile {
                         team: manifest,
                         ..team
                     },
+                    true,
                 )?;
             }
             Ok(reply)
@@ -190,7 +191,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     if human.trim().is_empty() && assistant.trim().is_empty() {
                         if initial {
                             config.fields.remove("setup_members_pending");
-                            config.save(file)?
+                            save_session(&config, file, true)?
                         }
                         return Ok(Reply::Team(Some(team)));
                     }
@@ -220,7 +221,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                         "registration".into(),
                         serde_json::to_value((&human, &assistant, initial, &intent))?,
                     );
-                    config.save(file)?;
+                    save_session(&config, file, true)?;
                     (human, assistant, initial, intent)
                 }
             };
@@ -248,7 +249,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             }
             config.fields.remove("registration");
             config.fields.remove("setup_members_pending");
-            save_profile(config, file, team)
+            store_profile(config, file, team, !initial)
         }
         Request::Identities { human, assistant } => {
             let (human, assistant) =
@@ -283,7 +284,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     config
                         .fields
                         .insert("initial_commit".into(), serde_json::to_value(&intent)?);
-                    config.save(file)?;
+                    save_session(&config, file, true)?;
                     operations::publish_initial(
                         &roots.state,
                         &team.remote,
@@ -399,7 +400,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     local.push((draft, copy))
                 }
             }
-            let remote = crate::adapters::git::drafts::discover(
+            let remote = crate::adapters::git::drafts::discover_verified(
                 &roots.state,
                 &team.team,
                 &team.remote,
@@ -460,9 +461,9 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             match action {
                 SyncAction::SetMode(mode) => sync.set_mode(mode)?,
                 SyncAction::Apply(plan) => {
-                    return Ok(Reply::SpaceSync(sync.synchronize(Some(&plan))?));
+                    return Ok(Reply::SpaceSync(sync.sync_and_cache(Some(&plan))?));
                 }
-                SyncAction::Preview | SyncAction::RefreshPreview => {}
+                SyncAction::Status | SyncAction::RefreshPreview => {}
             }
             Ok(Reply::SpaceSync(sync.preview()?))
         }
@@ -490,36 +491,37 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             }
             Ok(Reply::Work(result))
         }
-        Request::Workspace => {
-            let mut names = Vec::new();
-            fn visit(root: &Path, dir: &Path, names: &mut Vec<String>) -> io::Result<()> {
-                for item in fs::read_dir(dir)? {
-                    let item = item?;
-                    let path = item.path();
-                    let name = item.file_name();
-                    if name.to_string_lossy().eq_ignore_ascii_case(".git")
-                        || name.to_string_lossy().starts_with(".synod-sync-")
-                    {
-                        continue;
-                    }
-                    names.push(
-                        path.strip_prefix(root)
-                            .map_err(io::Error::other)?
-                            .display()
-                            .to_string(),
-                    );
-                    if item.file_type()?.is_dir() {
-                        visit(root, &path, names)?
-                    }
-                }
-                Ok(())
-            }
-            visit(&roots.work, &roots.work, &mut names)?;
-            names.sort();
-            Ok(Reply::Files(names))
-        }
+        Request::Workspace => workspace_tree(&roots.work),
         _ => Err(io::Error::other("Unexpected request")),
     }
+}
+fn workspace_tree(root: &Path) -> io::Result<Reply> {
+    let mut names = Vec::new();
+    fn visit(root: &Path, dir: &Path, names: &mut Vec<String>) -> io::Result<()> {
+        for item in fs::read_dir(dir)? {
+            let item = item?;
+            let path = item.path();
+            let name = item.file_name();
+            if name.to_string_lossy().eq_ignore_ascii_case(".git")
+                || name.to_string_lossy().starts_with(".synod-sync-")
+            {
+                continue;
+            }
+            names.push(
+                path.strip_prefix(root)
+                    .map_err(io::Error::other)?
+                    .display()
+                    .to_string(),
+            );
+            if item.file_type()?.is_dir() {
+                visit(root, &path, names)?
+            }
+        }
+        Ok(())
+    }
+    visit(root, root, &mut names)?;
+    names.sort();
+    Ok(Reply::Files(names))
 }
 fn board_reply(
     state: &Path,
@@ -560,6 +562,95 @@ fn board_reply(
     Ok(Reply::Published(letters))
 }
 
+fn local_drafts<T: serde::de::DeserializeOwned>(base: &Path) -> io::Result<Vec<T>> {
+    if let Some(rows) = read_optional(&base.join("current-list.json"))? {
+        return Ok(rows);
+    }
+    let entries = match fs::read_dir(base) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut rows = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let copy = entry.path().join("primary");
+        if !copy.join("sent").exists()
+            && let Some(row) = read_optional(&copy.join("editing.json"))?
+        {
+            rows.push(row)
+        }
+    }
+    Ok(rows)
+}
+
+fn local_board(state: &Path, p: &Profile, entry: Entry) -> io::Result<Reply> {
+    #[derive(serde::Deserialize)]
+    struct Projection {
+        remote: String,
+        team: crate::application::setup::NewTeam,
+        letters: Vec<Row>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Row {
+        id: String,
+        title: String,
+        author: String,
+        to: String,
+        cc: Vec<String>,
+        events: Vec<EventId>,
+    }
+    #[derive(serde::Deserialize)]
+    struct EventId {
+        event_id: String,
+    }
+    let team = state.join("teams").join(p.team.id());
+    let actor = entry.actor(p);
+    let receipts = team.join("notices").join(actor);
+    let mut letters = Vec::new();
+    let path = team.join("verified-board.json");
+    // Parse from bytes so skipping a large body does not require one system call per byte.
+    match fs::read(path) {
+        Ok(bytes) => {
+            let projection: Projection = serde_json::from_slice(&bytes)?;
+            if projection.remote == p.remote && projection.team.id() == p.team.id() {
+                for row in projection.letters {
+                    let directed = !actor.is_empty()
+                        && (row.to == actor || row.cc.iter().any(|id| id == actor));
+                    let unread = directed
+                        && row
+                            .events
+                            .first()
+                            .is_some_and(|e| !receipts.join(&e.event_id).exists());
+                    letters.push(LetterRow {
+                        id: row.id,
+                        title: row.title,
+                        author: row.author,
+                        to: row.to,
+                        cc: row.cc,
+                        unread,
+                    });
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let drafts = if entry.bound(p) {
+        local_drafts(&team.join("drafts").join(actor))?
+    } else {
+        Vec::new()
+    };
+    Ok(Reply::Board {
+        actor: actor.into(),
+        letters,
+        drafts,
+    })
+}
+
 pub(super) fn cached_query(
     file: &Path,
     request: &Request,
@@ -567,13 +658,46 @@ pub(super) fn cached_query(
 ) -> io::Result<Option<Reply>> {
     if !matches!(
         request,
-        Request::Published | Request::Read(_) | Request::Profile | Request::Drafts
+        Request::Workspace
+            | Request::Identities { .. }
+            | Request::ToggleTag(_)
+            | Request::Tags
+            | Request::SpaceSync {
+                action: SyncAction::Status | SyncAction::SetMode(_),
+                ..
+            }
+            | Request::Theme
+            | Request::SetupPending
+            | Request::Interval
+            | Request::Board
+            | Request::OpenDraft(_)
+            | Request::Published
+            | Request::Read(_)
+            | Request::Profile
+            | Request::Drafts
     ) {
         return Ok(None);
     }
     let cfg = ClientConfig::read(file)?;
+    match request {
+        Request::Theme => return Ok(Some(Reply::Color(cfg.theme_rgb))),
+        Request::Interval => return Ok(Some(Reply::Interval(cfg.sync_interval_seconds))),
+        Request::SetupPending => {
+            return Ok(Some(Reply::Pending(
+                cfg.fields
+                    .get("setup_members_pending")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )));
+        }
+        _ => {}
+    }
     let Some(p) = profile(&cfg)? else {
-        return Ok(None);
+        return if matches!(request, Request::Profile) && matches!(entry, Entry::Human) {
+            Ok(Some(Reply::Team(None)))
+        } else {
+            Ok(None)
+        };
     };
     if matches!(entry, Entry::Assistant) && !entry.bound(&p) {
         return Err(io::Error::other(
@@ -583,20 +707,116 @@ pub(super) fn cached_query(
     if matches!(request, Request::Profile) {
         return Ok(Some(Reply::Team(Some(p))));
     }
+    if let Request::Identities { human, assistant } = request {
+        if cfg.pending_team.is_some() {
+            return Ok(None);
+        }
+        let (human, assistant) =
+            crate::application::setup::Activation::parse(human, assistant)?.slots();
+        return ClientConfig::try_update(file, |current| {
+            let mut profile = profile(current)?.ok_or_else(|| io::Error::other("Team required"))?;
+            if current.pending_team.is_some()
+                || !(human.is_empty() || profile.team.human(human))
+                || !(assistant.is_empty() || profile.team.assistant(assistant))
+            {
+                return Err(io::Error::other(
+                    "Unknown member or incorrect identity slot",
+                ));
+            }
+            profile.human = human.into();
+            profile.assistant = assistant.into();
+            current
+                .fields
+                .insert("profile".into(), serde_json::to_value(&profile)?);
+            Ok(Some(Reply::Team(Some(profile))))
+        });
+    }
     let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
-    if matches!(request, Request::Drafts) {
-        let path = roots
+    match request {
+        Request::ToggleTag(name) => {
+            return Ok(Some(Reply::Tags(crate::adapters::local::tags::toggle(
+                &roots.state,
+                &roots.work,
+                &p.team,
+                name,
+            )?)));
+        }
+        Request::SpaceSync {
+            space,
+            action: SyncAction::SetMode(mode),
+        } => {
+            let local = crate::adapters::git::workspace_sync::Space::open(
+                &roots.state,
+                &roots.work,
+                &p.team,
+                space,
+            )?;
+            local.set_mode(*mode)?;
+            return Ok(Some(Reply::SpaceSync(
+                crate::adapters::git::workspace_sync::Space::status(&roots.state, &p.team, space)?,
+            )));
+        }
+        Request::Workspace => return workspace_tree(&roots.work).map(Some),
+        Request::Tags => {
+            return Ok(Some(Reply::Tags(crate::adapters::local::tags::view(
+                &roots.state,
+                &p.team,
+            )?)));
+        }
+        Request::SpaceSync {
+            space,
+            action: SyncAction::Status,
+        } => {
+            return Ok(Some(Reply::SpaceSync(
+                crate::adapters::git::workspace_sync::Space::status(&roots.state, &p.team, space)?,
+            )));
+        }
+        _ => {}
+    }
+    if matches!(request, Request::Board) {
+        return Ok(Some(local_board(&roots.state, &p, entry)?));
+    }
+    if let Request::OpenDraft(id) = request {
+        if !entry.bound(&p)
+            || !id
+                .strip_prefix("letter-local-")
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(io::Error::other("Invalid draft reference"));
+        }
+        let copy = roots
             .state
             .join("teams")
             .join(p.team.id())
             .join("drafts")
             .join(entry.actor(&p))
-            .join("current-list.json");
-        return Ok(read_optional::<Vec<Draft>>(&path)?.map(Reply::Drafts));
+            .join(id)
+            .join("primary");
+        if copy.join("sent").exists() {
+            return Err(io::Error::other("Draft already sent"));
+        }
+        return Ok(Some(Reply::Draft(serde_json::from_slice(&fs::read(
+            copy.join("editing.json"),
+        )?)?)));
     }
-    let Some(mut board) = operations::cached_board(&roots.state, &p.team, &p.remote)? else {
-        return Ok(None);
-    };
+    if matches!(request, Request::Drafts) {
+        let drafts = if entry.bound(&p) {
+            local_drafts(
+                &roots
+                    .state
+                    .join("teams")
+                    .join(p.team.id())
+                    .join("drafts")
+                    .join(entry.actor(&p)),
+            )?
+        } else {
+            Vec::new()
+        };
+        return Ok(Some(Reply::Drafts(drafts)));
+    }
+    let mut letters = operations::cached_board(&roots.state, &p.team, &p.remote)?
+        .map(|b| b.letters)
+        .unwrap_or_default();
     let query = match request {
         Request::Read(id) => Request::Read(id.clone()),
         _ => Request::Published,
@@ -606,7 +826,7 @@ pub(super) fn cached_query(
         &p,
         query,
         entry,
-        &mut board.letters,
+        &mut letters,
     )?))
 }
 
@@ -662,7 +882,7 @@ pub(super) fn synchronize(file: &Path) -> io::Result<()> {
             &p.team,
             space,
         );
-        result = result.and(sync.and_then(|s| s.synchronize(None).map(|_| ())));
+        result = result.and(sync.and_then(|s| s.sync_and_cache(None).map(|_| ())));
     }
     result
 }
@@ -741,7 +961,7 @@ fn retry_outbox(state: &Path, profile: &Profile) -> io::Result<()> {
 }
 fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match fs::File::open(path) {
-        Ok(f) => Ok(Some(serde_json::from_reader(f)?)),
+        Ok(f) => Ok(Some(serde_json::from_reader(std::io::BufReader::new(f))?)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -802,11 +1022,42 @@ fn finish_cloud_save(
     fs::remove_file(copy.join("save-pending.json"))?;
     Ok(draft)
 }
-fn save_profile(mut config: ClientConfig, file: &Path, p: Profile) -> io::Result<Reply> {
+fn save_session(config: &ClientConfig, file: &Path, preserve_slots: bool) -> io::Result<()> {
+    ClientConfig::try_update(file, |current| {
+        let active = profile(current)?;
+        let custom = current.fields.remove("custom_theme");
+        current.fields = config.fields.clone();
+        current.fields.remove("custom_theme");
+        if let Some(custom) = custom {
+            current.fields.insert("custom_theme".into(), custom);
+        }
+        current.pending_team = config.pending_team.clone();
+        if preserve_slots
+            && let (Some(active), Some(mut updated)) = (active, profile(current)?)
+            && active.team.id() == updated.team.id()
+        {
+            updated.human = active.human;
+            updated.assistant = active.assistant;
+            current
+                .fields
+                .insert("profile".into(), serde_json::to_value(updated)?);
+        }
+        Ok(())
+    })
+}
+fn save_profile(config: ClientConfig, file: &Path, p: Profile) -> io::Result<Reply> {
+    store_profile(config, file, p, false)
+}
+fn store_profile(
+    mut config: ClientConfig,
+    file: &Path,
+    p: Profile,
+    preserve_slots: bool,
+) -> io::Result<Reply> {
     config
         .fields
         .insert("profile".into(), serde_json::to_value(&p)?);
-    config.save(file)?;
+    save_session(&config, file, preserve_slots)?;
     Ok(Reply::Team(Some(p)))
 }
 

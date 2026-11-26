@@ -20,8 +20,10 @@ use std::{
 };
 
 fn write<T: Serialize>(stream: &mut UnixStream, value: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *stream, value)?;
-    stream.write_all(b"\n")
+    let mut output = std::io::BufWriter::new(stream);
+    serde_json::to_writer(&mut output, value)?;
+    output.write_all(b"\n")?;
+    output.flush()
 }
 fn read<T: DeserializeOwned>(reader: &mut BufReader<UnixStream>) -> io::Result<T> {
     let mut line = String::new();
@@ -116,6 +118,13 @@ fn connection(
     loop {
         let request = read(&mut reader)?;
         let close = matches!(request, Request::Close);
+        let refresh_team = matches!(
+            request,
+            Request::Join(_)
+                | Request::Create { .. }
+                | Request::Register { .. }
+                | Request::Identities { .. }
+        );
         let result = (|| -> io::Result<Reply> {
             if matches!(request, Request::SyncStatus) {
                 return Ok(Reply::SyncStatus(
@@ -128,28 +137,31 @@ fn connection(
             if let Some(reply) = super::host::cached_query(&file, &request, entry)? {
                 return Ok(reply);
             }
+            match &request {
+                Request::ApplyTheme(rgb) => {
+                    ClientConfig::update(&file, |c| {
+                        c.theme_rgb = *rgb;
+                        c.fields.insert("custom_theme".into(), true.into());
+                    })?;
+                    return Ok(Reply::Color(*rgb));
+                }
+                Request::SetInterval(value) => {
+                    ClientConfig::update(&file, |c| c.sync_interval_seconds = *value)?;
+                    let _ = wake.send(());
+                    return Ok(Reply::Ready);
+                }
+                Request::Close => return Ok(Reply::Ready),
+                _ => {}
+            }
             let _guard = writer
                 .lock()
                 .map_err(|_| io::Error::other("Settings lock unavailable"))?;
             match request {
-                Request::ApplyTheme(rgb) => {
-                    let mut config = ClientConfig::read(&file)?;
-                    config.theme_rgb = rgb;
-                    config.fields.insert("custom_theme".into(), true.into());
-                    config.save(&file)?;
-                    Ok(Reply::Color(rgb))
-                }
+                Request::ApplyTheme(_) | Request::SetInterval(_) => unreachable!(),
                 Request::SyncStatus => unreachable!(),
                 Request::Interval => Ok(Reply::Interval(
                     ClientConfig::read(&file)?.sync_interval_seconds,
                 )),
-                Request::SetInterval(value) => {
-                    let mut config = ClientConfig::read(&file)?;
-                    config.sync_interval_seconds = value;
-                    config.save(&file)?;
-                    let _ = wake.send(());
-                    Ok(Reply::Ready)
-                }
                 Request::Theme => Ok(Reply::Color(ClientConfig::read(&file)?.theme_rgb)),
                 Request::Close => Ok(Reply::Ready),
                 other @ (Request::Profile
@@ -162,6 +174,8 @@ fn connection(
                 | Request::Task { .. }
                 | Request::Read(_)
                 | Request::Published
+                | Request::Board
+                | Request::OpenDraft(_)
                 | Request::Drafts
                 | Request::SaveDraft(_)
                 | Request::Tags
@@ -172,6 +186,9 @@ fn connection(
                 Request::Hello(..) => Err(io::Error::other("Session already connected")),
             }
         })();
+        if refresh_team && result.is_ok() {
+            let _ = wake.send(());
+        }
         let reply = result.unwrap_or_else(|e| Reply::Failure(e.to_string()));
         write(reader.get_mut(), &reply)?;
         if close {
@@ -298,4 +315,97 @@ pub fn host(file: PathBuf) -> io::Result<()> {
     fs::remove_file(runtime.join("endpoint.json"))?;
     fs::remove_file(path)?;
     fs::remove_dir(private_dir)
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+    use crate::session::protocol::Profile;
+
+    #[test]
+    fn cold_navigation_and_preferences_complete_while_sync_writer_is_busy() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("synod-nav-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let file = root.join("client.json");
+        let roots = bootstrap::initialize(&file, &root.join("state"), &root.join("work"))?;
+        let team: crate::application::setup::NewTeam =
+            serde_json::from_str(include_str!("../../tests/fixtures/v1/team/team.json"))?;
+        let copy = roots
+            .state
+            .join("teams")
+            .join(team.id())
+            .join("drafts/member-alice/letter-local-1/primary");
+        fs::create_dir_all(&copy)?;
+        fs::write(copy.join("editing.json"),br#"{"reference":"letter-local-1","title":"local edit","to":"","cc":"","body":"offline body"}"#)?;
+        let mut cfg = ClientConfig::read(&file)?;
+        let profile = Profile {
+            team,
+            human: "member-alice".into(),
+            assistant: String::new(),
+            remote: root.join("missing.git").display().to_string(),
+        };
+        cfg.fields
+            .insert("profile".into(), serde_json::to_value(profile)?);
+        cfg.save(&file)?;
+        let writer = Arc::new(Mutex::new(()));
+        let guard = writer.lock().unwrap();
+        let (socket, server) = UnixStream::pair()?;
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let lock = writer.clone();
+        let (wake, _rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            connection(
+                server,
+                Arc::new(file),
+                lock,
+                "fixture".into(),
+                wake,
+                Arc::new(Mutex::new(None)),
+            )
+        });
+        fs::create_dir_all(roots.work.join("local-notes"))?;
+        let mut client = Client(BufReader::new(socket));
+        assert!(matches!(
+            client.request(Request::Hello(VERSION, "fixture".into(), Entry::Human))?,
+            Reply::Ready
+        ));
+        for request in [
+            Request::Theme,
+            Request::Profile,
+            Request::SetupPending,
+            Request::Workspace,
+            Request::Tags,
+            Request::Drafts,
+            Request::Published,
+            Request::ApplyTheme([1, 2, 3]),
+            Request::ToggleTag("local-notes".into()),
+            Request::SpaceSync {
+                space: "local-notes".into(),
+                action: crate::session::protocol::SyncAction::SetMode(
+                    crate::adapters::git::workspace_sync::Mode::WhenClean,
+                ),
+            },
+            Request::Identities {
+                human: "member-alice".into(),
+                assistant: String::new(),
+            },
+        ] {
+            client.request(request)?;
+        }
+        let Reply::Board {
+            drafts, letters, ..
+        } = client.request(Request::Board)?
+        else {
+            panic!("missing board")
+        };
+        assert_eq!(drafts[0].title, "local edit");
+        assert!(letters.is_empty());
+        assert!(
+            matches!(client.request(Request::OpenDraft("letter-local-1".into()))?,Reply::Draft(d) if d.body=="offline body")
+        );
+        client.request(Request::Close)?;
+        drop(guard);
+        worker.join().unwrap()?;
+        fs::remove_dir_all(root)
+    }
 }

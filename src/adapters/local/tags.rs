@@ -52,6 +52,18 @@ pub fn directory(root: &Path, name: &str) -> io::Result<PathBuf> {
 }
 pub type Tags = BTreeMap<String, String>;
 pub fn load(state: &Path, team: &NewTeam) -> io::Result<Tags> {
+    let dir = state.join("teams").join(team.id());
+    if dir.join("workspace-tags.json").is_file() {
+        return view(state, team);
+    }
+    team.validate()?;
+    let _guard = lock(&dir)?;
+    read(state, team, true)
+}
+pub(crate) fn view(state: &Path, team: &NewTeam) -> io::Result<Tags> {
+    read(state, team, false)
+}
+fn read(state: &Path, team: &NewTeam, seed: bool) -> io::Result<Tags> {
     team.validate()?;
     let dir = state.join("teams").join(team.id());
     let path = dir.join("workspace-tags.json");
@@ -75,7 +87,9 @@ pub fn load(state: &Path, team: &NewTeam) -> io::Result<Tags> {
                 .into_iter()
                 .map(|(id, label)| (id.to_owned(), label.to_owned()))
                 .collect();
-            save(&dir, &tags)?;
+            if seed {
+                save(&dir, &tags)?;
+            }
             Ok(tags)
         }
         Err(e) => Err(e),
@@ -89,8 +103,20 @@ fn save(dir: &Path, tags: &Tags) -> io::Result<()> {
     file.sync_all()?;
     fs::rename(temp, dir.join("workspace-tags.json"))
 }
+pub(crate) fn lock(dir: &Path) -> io::Result<fs::File> {
+    fs::create_dir_all(dir)?;
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("workspace-settings.lock"))?;
+    f.lock()?;
+    Ok(f)
+}
 pub fn toggle(state: &Path, work: &Path, team: &NewTeam, name: &str) -> io::Result<Tags> {
-    let mut tags = load(state, team)?;
+    team.validate()?;
+    let _guard = lock(&state.join("teams").join(team.id()))?;
+    let mut tags = view(state, team)?;
     if tags.remove(name).is_none() {
         if !directory(work, name)?.is_dir() {
             return Err(io::Error::other("请选择已有文件夹"));

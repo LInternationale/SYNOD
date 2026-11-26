@@ -204,9 +204,11 @@ pub(crate) fn cached_board(
         .join(team.id())
         .join("verified-board.json");
     match std::fs::File::open(path) {
-        Ok(f) => Ok(serde_json::from_reader::<_, VerifiedBoard>(f)
-            .ok()
-            .filter(|b| b.remote == remote && b.team.id() == team.id())),
+        Ok(f) => Ok(
+            serde_json::from_reader::<_, VerifiedBoard>(std::io::BufReader::new(f))
+                .ok()
+                .filter(|b| b.remote == remote && b.team.id() == team.id()),
+        ),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
