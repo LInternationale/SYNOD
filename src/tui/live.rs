@@ -1,7 +1,7 @@
 //! Interactive terminal client.
 use super::{
     bulletin::{BoardAction, BoardRows, Bulletin, DraftView},
-    preferences::{SettingsAction, ThemeColor, ThemeForm},
+    preferences::ThemeColor,
 };
 use crate::{
     application::setup::NewTeam,
@@ -25,7 +25,7 @@ use std::{
     io::{self, Stdout},
     path::Path,
 };
-type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(super) type Term = Terminal<CrosstermBackend<Stdout>>;
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
@@ -38,7 +38,7 @@ impl Drop for Restore {
         let _ = terminal::disable_raw_mode();
     }
 }
-fn input() -> io::Result<Event> {
+pub(super) fn input() -> io::Result<Event> {
     let e = event::read()?;
     if matches!(e,Event::Key(k) if k.code==KeyCode::Char('c')&&k.modifiers.contains(KeyModifiers::CONTROL))
     {
@@ -64,7 +64,7 @@ struct Form<'a> {
     focus: usize,
     help: &'a str,
 }
-enum Action {
+pub(super) enum Action {
     Back,
     Button(usize),
 }
@@ -105,10 +105,11 @@ impl<'a> Form<'a> {
                 let [help_area, inner] =
                     Layout::vertical([Constraint::Length(h), Constraint::Min(0)]).areas(inner);
                 f.render_widget(help, help_area);
-                let [fields, bar, status] = Layout::vertical([
+                let [fields, bar, status, hint] = Layout::vertical([
                     Constraint::Min(0),
                     Constraint::Length(1),
-                    Constraint::Length(2),
+                    Constraint::Length(u16::from(!message.is_empty())),
+                    Constraint::Length(1),
                 ])
                 .areas(inner);
                 bounds.clear();
@@ -146,7 +147,7 @@ impl<'a> Form<'a> {
                 .split(bar);
                 for (i, (label, rect)) in self.buttons.iter().zip(zones.iter()).enumerate() {
                     let idx = self.fields.len() + i;
-                    let w = Paragraph::new(*label).centered();
+                    let w = Paragraph::new(format!("{} {label}", i + 1)).centered();
                     f.render_widget(
                         if idx == self.focus {
                             w.style(color.highlight())
@@ -158,9 +159,22 @@ impl<'a> Form<'a> {
                     bounds.push((idx, *rect));
                 }
                 f.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), status);
+                f.render_widget(
+                    Paragraph::new(if self.focus < self.fields.len() {
+                        "输入 · 编辑"
+                    } else {
+                        "enter · 选择"
+                    }),
+                    hint,
+                );
             })?;
             match input()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                    _ if let Some(i) =
+                        super::shortcut(k, self.buttons.len(), self.focus < self.fields.len()) =>
+                    {
+                        return Ok(Action::Button(i));
+                    }
                     KeyCode::Esc => return Ok(Action::Back),
                     code if let Some(next) =
                         super::focus_step(code, self.focus, count, &bounds) =>
@@ -204,12 +218,13 @@ impl<'a> Form<'a> {
 fn notice(t: &mut Term, c: ThemeColor, text: &str) -> io::Result<()> {
     loop {
         t.draw(|f| {
-            f.render_widget(
-                Paragraph::new(text)
-                    .wrap(Wrap { trim: false })
-                    .block(super::page("提示", c)),
-                f.area(),
-            )
+            let page = super::page("提示", c);
+            let inner = page.inner(f.area());
+            f.render_widget(page, f.area());
+            let [body, hint] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+            f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
+            f.render_widget(Paragraph::new("esc · 返回"), hint);
         })?;
         if matches!(input()?,Event::Key(k) if k.kind==KeyEventKind::Press && k.code==KeyCode::Esc) {
             break;
@@ -267,7 +282,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
         identities(t, &mut client, color)?
     }
     let mut board = Bulletin::default();
-    let mut filter = "all".to_string();
+    let mut filter = [false; 2];
     let mut last_error = None;
     'refresh: loop {
         if let Reply::SyncStatus(error) = client.request(Request::SyncStatus)? {
@@ -300,10 +315,10 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             .collect();
         let views: Vec<_> = published
             .iter()
-            .filter(|l| match filter.as_str() {
-                "to_me" => !actor.is_empty() && l.to == actor,
-                "cc_me" => l.cc.contains(&actor),
-                _ => true,
+            .filter(|l| {
+                filter == [false; 2]
+                    || !actor.is_empty()
+                        && (filter[0] && l.to == actor || filter[1] && l.cc.contains(&actor))
             })
             .map(|l| super::LetterView {
                 id: &l.id,
@@ -311,7 +326,14 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 body: "",
             })
             .collect();
-        let rows = BoardRows::new(if filter == "all" { &draft_views } else { &[] }, &views);
+        let rows = BoardRows::new(
+            if filter == [false; 2] {
+                &draft_views
+            } else {
+                &[]
+            },
+            &views,
+        );
         let action = loop {
             let area = t.draw(|f| board.render_with_theme(f, &rows, color))?.area;
             if !event::poll(std::time::Duration::from_secs(2))? {
@@ -329,23 +351,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 }
                 board.return_to_list();
             }
-            BoardAction::Filter => {
-                if let Some(choice) = choose(
-                    t,
-                    color,
-                    "筛选信件",
-                    &[
-                        ("all", "全部信件"),
-                        ("to_me", "发给我的"),
-                        ("cc_me", "抄送我的"),
-                    ],
-                    &[filter.clone()],
-                    false,
-                )? && let Some(value) = choice.first()
-                {
-                    filter = value.clone()
-                }
-            }
+            BoardAction::Filter => filter_page(t, color, &mut filter)?,
             BoardAction::Compose => compose(t, &mut client, color, Draft::default(), &published)?,
             BoardAction::QuickReply(id) => {
                 if let Some(letter) = published.iter().find(|l| l.id == id) {
@@ -371,49 +377,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 }
             }
             BoardAction::Preferences => {
-                let mut menu = Form::new(
-                    "偏好",
-                    vec![],
-                    &["设置主题色", "身份", "添加成员", "同步间隔", "子工作区标签"],
-                );
-                match menu.interact(t, color, "")? {
-                    Action::Button(0) => {
-                        let mut form = ThemeForm::new(color);
-                        loop {
-                            let area = t.draw(|f| form.render(f))?.area;
-                            match form.handle(input()?, area, |value| {
-                                client.request(Request::ApplyTheme(value.0)).map(|_| ())
-                            }) {
-                                Ok(SettingsAction::Back) => break,
-                                Ok(SettingsAction::Stay) => color = form.editor.active(),
-                                Err(e) => notice(t, color, &format!("{e:?}"))?,
-                            }
-                        }
-                    }
-                    Action::Button(1) => identities(t, &mut client, color)?,
-                    Action::Button(2) => registration(t, &mut client, color, false)?,
-                    Action::Button(3) => {
-                        if let Reply::Interval(seconds) = client.request(Request::Interval)? {
-                            let mut form = Form::new(
-                                "后台同步间隔",
-                                vec![field("检查间隔（秒）", seconds.to_string())],
-                                &["应用设置"],
-                            );
-                            let mut error = String::new();
-                            while let Action::Button(_) = form.interact(t, color, &error)? {
-                                match form.val(0).parse() {
-                                    Ok(value) => {
-                                        client.request(Request::SetInterval(value))?;
-                                        break;
-                                    }
-                                    Err(_) => error = "请填写大于零的整数秒数".into(),
-                                }
-                            }
-                        }
-                    }
-                    Action::Button(_) => workspace(t, &mut client, color, &roots.work, true)?,
-                    Action::Back => {}
-                }
+                super::settings_tabs::run(t, &mut client, &mut color, &roots.work)?
             }
             BoardAction::Workspace => {
                 workspace(t, &mut client, color, &roots.work, false)?;
@@ -628,37 +592,11 @@ fn compose(
         .map(|l| (l.id.as_str(), l.title.as_str()))
         .collect();
     let mut editing = saved.clone();
-    let mut form = Form::new(
-        "写信",
-        vec![field("标题", &editing.title), field("正文", &editing.body)],
-        &[
-            "收件人",
-            "抄送",
-            "引用",
-            "子任务",
-            "添加附件",
-            "存草稿",
-            "寄信",
-        ],
-    );
+    let mut form = super::letter_editor::LetterEditor::default();
     let mut msg = String::new();
     loop {
-        let summary = format!(
-            "收件人 {}  抄送 {}  引用 {}  子任务 {}  附件 {}\n{msg}",
-            editing.to,
-            editing.cc,
-            editing.references.len(),
-            editing.dependencies.len(),
-            editing
-                .attachments
-                .iter()
-                .map(|a| a.filename.as_str())
-                .collect::<Vec<_>>()
-                .join("、")
-        );
-        let action = form.interact(t, c, &summary)?;
-        editing.title = form.val(0);
-        editing.body = form.val(1);
+        let action = form.interact(t, c, &mut editing, &roster, board, &msg)?;
+        msg.clear();
         match action {
             Action::Back => {
                 if editing == saved
@@ -690,11 +628,6 @@ fn compose(
             Action::Button(2) => {
                 if let Some(v) = choose(t, c, "引用", &letters, &editing.references, true)? {
                     editing.references = v
-                }
-            }
-            Action::Button(3) => {
-                if let Some(v) = choose(t, c, "子任务", &letters, &editing.dependencies, true)? {
-                    editing.dependencies = v
                 }
             }
             Action::Button(4) => match super::native_file::select() {
@@ -737,25 +670,26 @@ fn compose(
     }
 }
 
-fn workspace(
+pub(super) fn workspace(
     t: &mut Term,
     client: &mut Client,
     color: ThemeColor,
     root: &Path,
     tags_only: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<usize>> {
     use crate::adapters::git::workspace_sync::Mode;
-    let mut focus = 0usize;
+    let mut focus = if tags_only { 2usize } else { 0 };
     let mut selected = String::new();
     let mut status = String::new();
     let mut refresh = true;
     let mut names = Vec::new();
+    let mut tree_labels = Vec::new();
     let mut tags = std::collections::BTreeMap::new();
     let mut modes = std::collections::BTreeMap::new();
     let labels = if tags_only {
         vec!["切换标签"]
     } else {
-        vec!["打开工作目录", "保存工作", "提交工作", "获取更新"]
+        vec!["打开目录", "保存工作", "提交工作", "获取更新"]
     };
     loop {
         if refresh {
@@ -767,7 +701,7 @@ fn workspace(
             }
             modes.clear();
             for tag in tags.keys() {
-                if !names.contains(tag) {
+                if !names.contains(tag) && !root.join(tag).exists() {
                     names.push(tag.clone());
                 }
                 if let Ok(Reply::SpaceSync(p)) = client.request(Request::SpaceSync {
@@ -777,7 +711,7 @@ fn workspace(
                     modes.insert(tag.clone(), p);
                 }
             }
-            names.sort();
+            tree_labels = super::tree::labels(&mut names);
             if !names.contains(&selected) {
                 selected = names.first().cloned().unwrap_or_default();
             }
@@ -786,23 +720,34 @@ fn workspace(
         let index = names.iter().position(|s| *s == selected).unwrap_or(0);
         let mut bounds = Vec::new();
         let mut rows = Vec::new();
+        let mut tab_hits = Vec::new();
         t.draw(|f| {
-            let block = super::page(
-                if tags_only {
-                    "子工作区标签"
-                } else {
-                    "工作区"
-                },
-                color,
-            );
+            let block = super::page(if tags_only { "偏好" } else { "工作区" }, color);
             let inner = block.inner(f.area());
             f.render_widget(block, f.area());
-            let [tree, bar, footer] = Layout::vertical([
+            let inner = if tags_only {
+                let [strip, rest] = Layout::vertical([
+                    Constraint::Length(super::action_height(inner.width, 4)),
+                    Constraint::Min(0),
+                ])
+                .areas(inner);
+                tab_hits = super::settings_tabs::tabs(f, strip, 2, focus == 2, color);
+                bounds.push((2, strip));
+                rest
+            } else {
+                inner
+            };
+            let [tree, bar, feedback, footer] = Layout::vertical([
                 Constraint::Min(0),
+                Constraint::Length(super::action_height(inner.width, labels.len())),
+                Constraint::Length(u16::from(!status.is_empty())),
                 Constraint::Length(1),
-                Constraint::Length(2),
             ])
             .areas(inner);
+            let border = ratatui::widgets::Block::bordered();
+            let content = border.inner(tree);
+            f.render_widget(border, tree);
+            let tree = content;
             bounds.push((0, tree));
             let count = usize::from(tree.height);
             for (n, name) in names
@@ -823,11 +768,11 @@ fn workspace(
                         Some(p) if !p.paths.is_empty() => " · 有更新",
                         _ => "",
                     };
-                    format!("{name}/  [{m}{update}]")
+                    format!("{}/  ◆ {m}{update}", tree_labels[n])
                 } else if root.join(name).is_dir() {
-                    format!("{name}/")
+                    format!("{}/", tree_labels[n])
                 } else {
-                    name.clone()
+                    tree_labels[n].clone()
                 };
                 let rect = Rect::new(tree.x, tree.y + rows.len() as u16, tree.width, 1);
                 let row = Paragraph::new(label);
@@ -835,7 +780,15 @@ fn workspace(
                     if focus == 0 && n == index {
                         row.style(color.highlight())
                     } else {
-                        row
+                        if tags.contains_key(name) {
+                            row.style(
+                                ratatui::style::Style::default()
+                                    .fg(color.rgb())
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            )
+                        } else {
+                            row
+                        }
                     },
                     rect,
                 );
@@ -843,17 +796,10 @@ fn workspace(
             }
             for (i, (label, rect)) in labels
                 .iter()
-                .zip(
-                    Layout::horizontal(vec![
-                        Constraint::Ratio(1, labels.len() as u32);
-                        labels.len()
-                    ])
-                    .split(bar)
-                    .iter(),
-                )
+                .zip(super::action_cells(bar, labels.len()).iter())
                 .enumerate()
             {
-                let w = Paragraph::new(*label).centered();
+                let w = Paragraph::new(format!("{} {label}", i + 1)).centered();
                 f.render_widget(
                     if focus == i + 1 {
                         w.style(color.highlight())
@@ -864,15 +810,19 @@ fn workspace(
                 );
                 bounds.push((i + 1, *rect));
             }
-            let help = if tags_only {
-                "选中文件夹，按空格添加或移除子工作区标签"
+            let help = if tags_only && focus == 2 {
+                "←/→ · 切换分类    ↓ · 配置"
+            } else if focus > 0 {
+                "enter · 执行"
+            } else if tags_only && (root.join(&selected).is_dir() || tags.contains_key(&selected)) {
+                "space · 切换子工作区状态"
+            } else if tags.contains_key(&selected) {
+                "space · 切换同步模式"
             } else {
-                "选中子工作区，按空格切换同步模式"
+                ""
             };
-            f.render_widget(
-                Paragraph::new(if status.is_empty() { help } else { &status }),
-                footer,
-            );
+            f.render_widget(Paragraph::new(status.as_str()), feedback);
+            f.render_widget(Paragraph::new(help), footer);
         })?;
         if !event::poll(std::time::Duration::from_secs(2))? {
             refresh = true;
@@ -880,19 +830,39 @@ fn workspace(
         }
         let toggle = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                KeyCode::Esc => return Ok(()),
+                _ if let Some(i) = super::shortcut(k, labels.len(), false) => {
+                    focus = i + 1;
+                    tags_only
+                }
+                KeyCode::Left if tags_only && focus == 2 => return Ok(Some(1)),
+                KeyCode::Right if tags_only && focus == 2 => return Ok(Some(3)),
+                KeyCode::Down | KeyCode::Enter if tags_only && focus == 2 => {
+                    focus = 0;
+                    continue;
+                }
+                KeyCode::Esc if tags_only && focus != 2 => {
+                    focus = 2;
+                    continue;
+                }
+                KeyCode::Esc => return Ok(None),
                 KeyCode::Up if focus == 0 && index > 0 => {
+                    status.clear();
                     selected = names[index - 1].clone();
                     continue;
                 }
                 KeyCode::Down if focus == 0 && index + 1 < names.len() => {
+                    status.clear();
                     selected = names[index + 1].clone();
                     continue;
                 }
                 KeyCode::Char(' ') if focus == 0 => true,
                 KeyCode::Enter if focus > 0 => tags_only,
-                code if let Some(next) =
-                    super::focus_step(code, focus, labels.len() + 1, &bounds) =>
+                code if let Some(next) = super::focus_step(
+                    code,
+                    focus,
+                    labels.len() + 1 + usize::from(tags_only),
+                    &bounds,
+                ) =>
                 {
                     focus = next;
                     continue;
@@ -901,6 +871,13 @@ fn workspace(
             },
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
                 let pos = Position::new(m.column, m.row);
+                if let Some(tab) = tab_hits.iter().position(|r| r.contains(pos)) {
+                    if tab != 2 {
+                        return Ok(Some(tab));
+                    }
+                    focus = 2;
+                    continue;
+                }
                 if let Some((n, _)) = rows.iter().find(|(_, r)| r.contains(pos)) {
                     selected = names[*n].clone();
                     focus = 0;
@@ -917,7 +894,19 @@ fn workspace(
         refresh = true;
         if toggle {
             let request = if tags_only {
-                Request::ToggleTag(selected.clone())
+                match modes.get(&selected).map(|p| p.mode) {
+                    Some(Mode::Manual) => Request::SpaceSync {
+                        space: selected.clone(),
+                        action: SyncAction::SetMode(Mode::WhenClean),
+                    },
+                    Some(Mode::WhenClean) => Request::ToggleTag(selected.clone()),
+                    None => {
+                        if !root.join(&selected).is_dir() {
+                            continue;
+                        }
+                        Request::ToggleTag(selected.clone())
+                    }
+                }
             } else if let Some(p) = modes.get(&selected) {
                 Request::SpaceSync {
                     space: selected.clone(),
@@ -1077,6 +1066,65 @@ fn workspace(
 }
 
 /// Edit a roster or reference selection without mutating the caller's values on Escape.
+fn filter_page(t: &mut Term, color: ThemeColor, filter: &mut [bool; 2]) -> io::Result<()> {
+    let mut focus = 0usize;
+    loop {
+        let mut rows = Vec::new();
+        t.draw(|f| {
+            let page = super::page("筛选", color);
+            let inner = page.inner(f.area());
+            f.render_widget(page, f.area());
+            for (i, name) in ["全部信件", "发给我的", "抄送我的"].iter().enumerate() {
+                let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+                f.render_widget(
+                    Paragraph::new(super::checkbox(
+                        if i == 0 {
+                            *filter == [false; 2]
+                        } else {
+                            filter[i - 1]
+                        },
+                        *name,
+                        i == focus,
+                        color,
+                    )),
+                    row,
+                );
+                rows.push((i, row));
+            }
+            f.render_widget(
+                Paragraph::new("space · 切换筛选    esc · 返回"),
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            );
+        })?;
+        match input()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Esc => return Ok(()),
+                KeyCode::Char(' ') => {}
+                code if let Some(next) = super::focus_step(code, focus, 3, &rows) => {
+                    focus = next;
+                    continue;
+                }
+                _ => continue,
+            },
+            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                let Some((i, _)) = rows
+                    .iter()
+                    .find(|(_, r)| r.contains(Position::new(m.column, m.row)))
+                else {
+                    continue;
+                };
+                focus = *i;
+            }
+            _ => continue,
+        }
+        if focus == 0 {
+            *filter = [false; 2]
+        } else {
+            filter[focus - 1] = !filter[focus - 1]
+        }
+    }
+}
+
 fn choose(
     t: &mut Term,
     color: ThemeColor,
@@ -1094,35 +1142,44 @@ fn choose(
             let block = super::page(title, color);
             let inner = block.inner(f.area());
             f.render_widget(block, f.area());
+            let [inner, footer] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+            f.render_widget(
+                Paragraph::new(if focus == options.len() {
+                    "enter · 确定"
+                } else if multi {
+                    "space · 切换选择"
+                } else {
+                    "enter · 选择"
+                }),
+                footer,
+            );
             let start = (focus + 1usize).saturating_sub(usize::from(inner.height));
             for (line, index) in (start..count).take(usize::from(inner.height)).enumerate() {
                 let rect = Rect::new(inner.x, inner.y + line as u16, inner.width, 1);
-                let text = if let Some((id, name)) = options.get(index) {
-                    format!(
-                        "{} {name}",
-                        if values.iter().any(|v| v == id) {
-                            "☑"
-                        } else {
-                            "☐"
-                        }
-                    )
+                let label = if let Some((id, name)) = options.get(index) {
+                    Paragraph::new(super::checkbox(
+                        values.iter().any(|v| v == id),
+                        *name,
+                        focus == index,
+                        color,
+                    ))
                 } else {
-                    "确定".into()
+                    Paragraph::new("1 确定")
+                        .centered()
+                        .style(if focus == index {
+                            color.highlight()
+                        } else {
+                            Default::default()
+                        })
                 };
-                let label = Paragraph::new(text);
-                f.render_widget(
-                    if focus == index {
-                        label.style(color.highlight())
-                    } else {
-                        label
-                    },
-                    rect,
-                );
+                f.render_widget(label, rect);
                 hits.push((index, rect));
             }
         })?;
         let activate = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                _ if super::shortcut(k, 1, false).is_some() => return Ok(Some(values)),
                 KeyCode::Esc => return Ok(None),
                 KeyCode::Up => {
                     focus = focus.saturating_sub(1);
@@ -1185,22 +1242,18 @@ fn task_detail(
     let mut message = String::new();
     let mut scroll = 0u16;
     loop {
-        let check = if staged {
-            "☑ 任务完成"
-        } else {
-            "☐ 任务完成"
-        };
         let mut bounds = Vec::new();
         t.draw(|f| {
             let outer = super::page(&letter.title, color);
             let inner = outer.inner(f.area());
             f.render_widget(outer, f.area());
             let show_progress = !letter.dependencies.is_empty() || !letter.checklist.is_empty();
-            let [meter, body, bar, footer] = Layout::vertical([
+            let [meter, body, bar, feedback, footer] = Layout::vertical([
                 Constraint::Length(u16::from(show_progress)),
                 Constraint::Min(0),
+                Constraint::Length(super::action_height(inner.width, 2)),
+                Constraint::Length(u16::from(!message.is_empty())),
                 Constraint::Length(1),
-                Constraint::Length(2),
             ])
             .areas(inner);
             if show_progress {
@@ -1230,14 +1283,11 @@ fn task_detail(
                     && item.line == line
                 {
                     positions.push((i + 2, lines.len()));
-                    let style = if focus == i + 2 {
-                        color.highlight()
-                    } else {
-                        Default::default()
-                    };
-                    lines.push(ratatui::text::Line::styled(
-                        format!("{} {}", if ticks[i] { "☑" } else { "☐" }, item.label),
-                        style,
+                    lines.push(super::checkbox(
+                        ticks[i],
+                        &item.label,
+                        focus == i + 2,
+                        color,
                     ));
                     next_item.next();
                 } else {
@@ -1317,11 +1367,20 @@ fn task_detail(
                     .scroll((scroll, 0)),
                 body,
             );
-            let zones = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(bar);
-            for (i, (label, rect)) in [check, "进度设置"].iter().zip(zones.iter()).enumerate() {
-                let w = Paragraph::new(*label).centered();
+            let zones = super::action_cells(bar, 2);
+            for (i, (label, rect)) in ["任务完成", "进度设置"]
+                .iter()
+                .zip(zones.iter())
+                .enumerate()
+            {
+                let w = if i == 0 {
+                    Paragraph::new(super::checkbox(staged, *label, focus == 0, color))
+                } else {
+                    Paragraph::new(format!("1 {label}"))
+                }
+                .centered();
                 f.render_widget(
-                    if i == focus {
+                    if i != 0 && i == focus {
                         w.style(color.highlight())
                     } else {
                         w
@@ -1330,17 +1389,22 @@ fn task_detail(
                 );
                 bounds.push((i, *rect));
             }
+            f.render_widget(Paragraph::new(message.as_str()), feedback);
             f.render_widget(
-                Paragraph::new(if message.is_empty() {
-                    "Space 切换勾选，Enter 提交"
+                Paragraph::new(if focus == 1 {
+                    "enter · 设置子任务"
                 } else {
-                    &message
+                    "space · 切换勾选    enter · 提交"
                 }),
                 footer,
             );
         })?;
         let submit = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                _ if super::shortcut(k, 1, false).is_some() => {
+                    focus = 1;
+                    true
+                }
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Char(' ') if focus >= 2 => {
                     ticks[focus - 2] = !ticks[focus - 2];

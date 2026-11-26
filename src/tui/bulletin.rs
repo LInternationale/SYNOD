@@ -34,7 +34,6 @@ enum Focus {
     Preferences,
     Workspace,
     Filter,
-    Reply,
 }
 
 impl Focus {
@@ -42,10 +41,9 @@ impl Focus {
         let order = [
             Self::List,
             Self::Compose,
-            Self::Preferences,
             Self::Workspace,
             Self::Filter,
-            Self::Reply,
+            Self::Preferences,
         ];
         let index = order.iter().position(|v| *v == self)?;
         {
@@ -59,10 +57,9 @@ impl Focus {
         .map(|i| order[i])
     }
 
-    fn action(self, selected: Option<&str>) -> Option<BoardAction<'static>> {
+    fn action(self, _selected: Option<&str>) -> Option<BoardAction<'static>> {
         match self {
             Self::Filter => Some(BoardAction::Filter),
-            Self::Reply => selected.map(|id| BoardAction::QuickReply(id.to_owned())),
             Self::List => None,
             Self::Compose => Some(BoardAction::Compose),
             Self::Preferences => Some(BoardAction::Preferences),
@@ -71,21 +68,20 @@ impl Focus {
     }
 }
 
-const BUTTONS: [(Focus, &str); 5] = [
+const BUTTONS: [(Focus, &str); 4] = [
     (Focus::Compose, "写信"),
-    (Focus::Preferences, "偏好"),
     (Focus::Workspace, "工作区"),
     (Focus::Filter, "筛选"),
-    (Focus::Reply, "快速回复"),
+    (Focus::Preferences, "偏好"),
 ];
-
-fn layout(area: Rect, reply: bool) -> (Rect, std::rc::Rc<[Rect]>) {
-    let count = if reply { 5 } else { 4 };
-    let [list, bar] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
-    (
-        list,
-        Layout::horizontal(vec![Constraint::Ratio(1, count); count as usize]).split(bar),
-    )
+fn layout(area: Rect, _reply: bool) -> (Rect, Vec<Rect>) {
+    let [list, bar, _] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(super::action_height(area.width, 4)),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    (list, super::action_cells(bar, 4))
 }
 
 /// Session snapshot projected into display rows. Keys are isolated by source.
@@ -160,7 +156,12 @@ impl Bulletin {
         let (list, buttons) = layout(frame.area(), self.selected_letter().is_some());
         self.screen.render_area(frame, list, &views, color);
         for ((focus, label), area) in BUTTONS.into_iter().zip(buttons.iter().copied()) {
-            let widget = Paragraph::new(label).centered();
+            let ordinal = BUTTONS
+                .iter()
+                .position(|b| b.0 == focus)
+                .unwrap_or_default()
+                + 1;
+            let widget = Paragraph::new(format!("{ordinal} {label}")).centered();
             let widget = if focus == self.focus {
                 widget.style(color.highlight())
             } else {
@@ -168,6 +169,17 @@ impl Bulletin {
             };
             frame.render_widget(widget, area);
         }
+        let hint = match self.focus {
+            Focus::List if self.selected_letter().is_some() => "enter · 查看信件    r · 快速回复",
+            Focus::List if !views.is_empty() => "enter · 编辑草稿",
+            Focus::List => "",
+            _ => "enter · 打开",
+        };
+        let area = frame.area();
+        frame.render_widget(
+            Paragraph::new(hint),
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+        );
     }
 
     pub fn handle<'a>(
@@ -180,6 +192,17 @@ impl Bulletin {
         self.screen.refresh(&views);
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if !matches!(self.screen, BoardScreen::Detail(_)) {
+                    if let Some(i) = super::shortcut(key, 4, false) {
+                        self.focus = BUTTONS[i].0;
+                        return self.focus.action(self.selected_letter());
+                    }
+                    if self.focus == Focus::List && key.code == KeyCode::Char('r') {
+                        return self
+                            .selected_letter()
+                            .map(|id| BoardAction::QuickReply(id.into()));
+                    }
+                }
                 if matches!(self.screen, BoardScreen::Detail(_)) {
                     self.screen.navigate(key.code, &views);
                 } else if self.focus == Focus::List

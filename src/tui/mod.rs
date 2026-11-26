@@ -3,7 +3,7 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
-    widgets::{Block, List, ListItem, Paragraph, Wrap},
+    widgets::{List, ListItem, Paragraph, Widget, Wrap},
 };
 
 /// Published letter data supplied by the session.
@@ -89,12 +89,10 @@ impl BoardScreen {
         let selection = self.position(letters);
         if let (Self::Detail(_), Some(index)) = (&self, selection) {
             let letter = &letters[index];
-            frame.render_widget(
-                Paragraph::new(letter.body)
-                    .wrap(Wrap { trim: false })
-                    .block(page(letter.title, color)),
-                area,
-            );
+            let header = page(letter.title, color);
+            let body = header.inner(area);
+            frame.render_widget(header, area);
+            frame.render_widget(Paragraph::new(letter.body).wrap(Wrap { trim: false }), body);
             return;
         }
         let items = letters.iter().enumerate().map(|(index, letter)| {
@@ -106,11 +104,10 @@ impl BoardScreen {
             }
         });
         let mut state = ratatui::widgets::ListState::default().with_selected(selection);
-        frame.render_stateful_widget(
-            List::new(items).block(page("公告板", color)),
-            area,
-            &mut state,
-        );
+        let header = page("公告板", color);
+        let body = header.inner(area);
+        frame.render_widget(header, area);
+        frame.render_stateful_widget(List::new(items), body, &mut state);
     }
 }
 
@@ -173,15 +170,105 @@ fn focus_step(
 }
 
 /// The title occupies the first row and the content spans the available width.
-fn page(title: &str, color: preferences::ThemeColor) -> Block<'_> {
-    Block::default()
-        .title(title)
-        .title_style(
-            ratatui::style::Style::default()
-                .fg(color.rgb())
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )
-        .padding(ratatui::widgets::Padding::new(0, 0, 1, 0))
+struct Page<'a> {
+    title: &'a str,
+    color: preferences::ThemeColor,
+}
+fn page(title: &str, color: preferences::ThemeColor) -> Page<'_> {
+    Page { title, color }
+}
+impl Page<'_> {
+    fn inner(&self, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+        let h = area.height.min(2);
+        ratatui::layout::Rect::new(area.x, area.y + h, area.width, area.height - h)
+    }
+}
+impl Widget for Page<'_> {
+    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        if area.is_empty() {
+            return;
+        }
+        let style = ratatui::style::Style::default().fg(self.color.rgb());
+        buf.set_stringn(
+            area.x,
+            area.y,
+            self.title,
+            area.width as usize,
+            style.add_modifier(ratatui::style::Modifier::BOLD),
+        );
+        if area.height > 1 {
+            for x in area.left()..area.right() {
+                buf[(x, area.y + 1)].set_symbol("─").set_style(style);
+            }
+        }
+    }
 }
 
 mod input_field;
+
+mod tree;
+
+fn checkbox<'a>(
+    checked: bool,
+    label: impl Into<String>,
+    focused: bool,
+    color: preferences::ThemeColor,
+) -> ratatui::text::Line<'a> {
+    use ratatui::{
+        style::Style,
+        text::{Line, Span},
+    };
+    let mark = if checked {
+        Span::styled("■", Style::default().fg(color.rgb()))
+    } else {
+        Span::raw("□")
+    };
+    Line::from(vec![
+        mark,
+        Span::styled(
+            format!(" {}", label.into()),
+            if focused {
+                color.highlight()
+            } else {
+                Style::default()
+            },
+        ),
+    ])
+}
+
+#[cfg(unix)]
+mod letter_editor;
+
+fn shortcut(key: crossterm::event::KeyEvent, count: usize, editing: bool) -> Option<usize> {
+    use crossterm::event::KeyModifiers;
+    let KeyCode::Char(ch) = key.code else {
+        return None;
+    };
+    if !ch.is_ascii_digit()
+        || key.modifiers.contains(KeyModifiers::CONTROL)
+        || (editing && !key.modifiers.contains(KeyModifiers::ALT))
+    {
+        return None;
+    }
+    let index = ch.to_digit(10)?.checked_sub(1)? as usize;
+    (index < count).then_some(index)
+}
+fn action_height(width: u16, count: usize) -> u16 {
+    count.div_ceil(usize::from((width / 10).max(1))) as u16
+}
+fn action_cells(area: ratatui::layout::Rect, count: usize) -> Vec<ratatui::layout::Rect> {
+    let cols = usize::from((area.width / 10).max(1));
+    (0..count)
+        .map(|i| {
+            ratatui::layout::Rect::new(
+                area.x + (i % cols) as u16 * 10,
+                area.y + (i / cols) as u16,
+                area.width.min(10),
+                u16::from(i / cols < usize::from(area.height)),
+            )
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+mod settings_tabs;

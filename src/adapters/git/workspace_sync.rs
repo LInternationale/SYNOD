@@ -48,14 +48,23 @@ fn relative(name: &str) -> io::Result<()> {
     }
     Ok(())
 }
-fn disk(dir: &Path) -> io::Result<Files> {
-    fn visit(root: &Path, path: &Path, files: &mut Files) -> io::Result<()> {
+fn disk(dir: &Path, work: &Path, ignored: &super::ignored::Ignored) -> io::Result<Files> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        files: &mut Files,
+        work: &Path,
+        ignored: &super::ignored::Ignored,
+    ) -> io::Result<()> {
         if !fs::symlink_metadata(path)?.is_dir() {
             return Err(invalid());
         }
         for e in fs::read_dir(path)? {
             let e = e?;
             let p = e.path();
+            if ignored.excludes(p.strip_prefix(work).map_err(io::Error::other)?) {
+                continue;
+            }
             let key = p
                 .strip_prefix(root)
                 .map_err(io::Error::other)?
@@ -63,7 +72,7 @@ fn disk(dir: &Path) -> io::Result<Files> {
                 .ok_or_else(invalid)?;
             relative(key)?;
             if e.file_type()?.is_dir() {
-                visit(root, &p, files)?
+                visit(root, &p, files, work, ignored)?
             } else if e.file_type()?.is_file() {
                 #[cfg(unix)]
                 let executable = e.metadata()?.permissions().mode() & 0o111 != 0;
@@ -84,7 +93,7 @@ fn disk(dir: &Path) -> io::Result<Files> {
     }
     let mut files = Files::new();
     match fs::symlink_metadata(dir) {
-        Ok(_) => visit(dir, dir, &mut files)?,
+        Ok(_) => visit(dir, dir, &mut files, work, ignored)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
@@ -164,6 +173,7 @@ struct Edit {
     after: Option<Blob>,
 }
 pub struct Space {
+    work: PathBuf,
     repo: PathBuf,
     area: PathBuf,
     local: PathBuf,
@@ -189,6 +199,7 @@ impl Space {
             .join("sync");
         fs::create_dir_all(&area)?;
         Ok(Self {
+            work: work.into(),
             repo: team_dir.join("repo.git"),
             area,
             local: crate::adapters::local::tags::directory(work, space)?,
@@ -268,15 +279,23 @@ impl Space {
             Err(e) => Err(e),
         }
     }
+    fn versions(&self, rev: &str) -> io::Result<(Files, Files, Files)> {
+        let base = self.base()?;
+        let remote = tree(&self.repo, rev, &self.name)?;
+        let mut tracked: std::collections::BTreeSet<_> = base
+            .keys()
+            .chain(remote.keys())
+            .map(|path| Path::new(&self.name).join(path))
+            .collect();
+        tracked.extend(super::ignored::Ignored::known(&self.repo)?);
+        let ignored = super::ignored::Ignored::read(&self.work, &self.repo, tracked)?;
+        let local = disk(&self.local, &self.work, &ignored)?;
+        Ok((base, local, remote))
+    }
     pub fn preview(&self) -> io::Result<Preview> {
         let rev = self.revision()?;
-        let mut plan = compare(
-            &self.base()?,
-            &disk(&self.local)?,
-            &tree(&self.repo, &rev, &self.name)?,
-            rev,
-            self.mode()?,
-        );
+        let (base, local, remote) = self.versions(&rev)?;
+        let mut plan = compare(&base, &local, &remote, rev, self.mode()?);
         plan.dirty |= self.area.join("pending-personal").exists();
         Ok(plan)
     }
@@ -288,9 +307,8 @@ impl Space {
     pub fn synchronize(&self, manual: Option<&Preview>) -> io::Result<Preview> {
         self.recover()?;
         let rev = self.revision()?;
-        let local = disk(&self.local)?;
-        let remote = tree(&self.repo, &rev, &self.name)?;
-        let mut plan = compare(&self.base()?, &local, &remote, rev, self.mode()?);
+        let (base, local, remote) = self.versions(&rev)?;
+        let mut plan = compare(&base, &local, &remote, rev, self.mode()?);
         plan.dirty |= self.area.join("pending-personal").exists();
         if let Some(observed) = manual
             && observed != &plan

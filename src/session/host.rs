@@ -491,17 +491,38 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             }
             Ok(Reply::Work(result))
         }
-        Request::Workspace => workspace_tree(&roots.work),
+        Request::Workspace => workspace_tree(
+            &roots,
+            &current
+                .ok_or_else(|| io::Error::other("Team required"))?
+                .team,
+        ),
         _ => Err(io::Error::other("Unexpected request")),
     }
 }
-fn workspace_tree(root: &Path) -> io::Result<Reply> {
+fn workspace_tree(
+    roots: &bootstrap::Roots,
+    team: &crate::application::setup::NewTeam,
+) -> io::Result<Reply> {
+    use crate::adapters::git::ignored::Ignored;
+    let root = &roots.work;
+    let repo = roots.state.join("teams").join(team.id()).join("repo.git");
+    let tracked = Ignored::known(&repo)?;
+    let ignored = Ignored::read(root, &repo, tracked)?;
     let mut names = Vec::new();
-    fn visit(root: &Path, dir: &Path, names: &mut Vec<String>) -> io::Result<()> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        names: &mut Vec<String>,
+        ignored: &Ignored,
+    ) -> io::Result<()> {
         for item in fs::read_dir(dir)? {
             let item = item?;
             let path = item.path();
             let name = item.file_name();
+            if ignored.excludes(path.strip_prefix(root).map_err(io::Error::other)?) {
+                continue;
+            }
             if name.to_string_lossy().eq_ignore_ascii_case(".git")
                 || name.to_string_lossy().starts_with(".synod-sync-")
             {
@@ -514,12 +535,12 @@ fn workspace_tree(root: &Path) -> io::Result<Reply> {
                     .to_string(),
             );
             if item.file_type()?.is_dir() {
-                visit(root, &path, names)?
+                visit(root, &path, names, ignored)?
             }
         }
         Ok(())
     }
-    visit(root, root, &mut names)?;
+    visit(root, root, &mut names, &ignored)?;
     names.sort();
     Ok(Reply::Files(names))
 }
@@ -756,7 +777,7 @@ pub(super) fn cached_query(
                 crate::adapters::git::workspace_sync::Space::status(&roots.state, &p.team, space)?,
             )));
         }
-        Request::Workspace => return workspace_tree(&roots.work).map(Some),
+        Request::Workspace => return workspace_tree(&roots, &p.team).map(Some),
         Request::Tags => {
             return Ok(Some(Reply::Tags(crate::adapters::local::tags::view(
                 &roots.state,

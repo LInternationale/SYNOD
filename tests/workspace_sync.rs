@@ -57,7 +57,23 @@ fn automatic_updates_preserve_normal_folders_and_isolate_dirty_tags() -> io::Res
         )?;
         Ok(())
     };
+    fs::write(author.join(".gitignore"), "*.log\n")?;
+    fs::write(
+        author.join(nested).join("generated.log"),
+        "local generated output",
+    )?;
     publish(nested, "first")?;
+    let ignored_path = format!("main:workspace/{nested}/generated.log");
+    assert!(
+        !Command::new("git")
+            .arg("--git-dir")
+            .arg(&repo)
+            .args(["cat-file", "-e", &ignored_path])
+            .output()?
+            .status
+            .success()
+    );
+
     publish("code", "code1")?;
     operations::published_letters(&state, &team, remote)?;
     let paper = Space::open(&state, &work, &team, nested)?;
@@ -77,6 +93,9 @@ fn automatic_updates_preserve_normal_folders_and_isolate_dirty_tags() -> io::Res
     assert_eq!(fs::read(work.join("code/file.txt"))?, b"code1");
     paper.set_mode(Mode::WhenClean)?;
     fs::write(work.join("code/file.txt"), "my changes")?;
+    fs::write(author.join(".gitignore"), "*.log\nfile.txt\n")?;
+    fs::write(work.join(".gitignore"), "*.log\nfile.txt\n")?;
+    fs::write(local.join("generated.log"), "keep my output")?;
     publish(nested, "second")?;
     publish("code", "code2")?;
     operations::published_letters(&state, &team, remote)?;
@@ -94,7 +113,8 @@ fn automatic_updates_preserve_normal_folders_and_isolate_dirty_tags() -> io::Res
         std::os::unix::fs::symlink(&root, work.join("outside"))?;
         assert!(tags::toggle(&state, &work, &team, "outside").is_err());
     }
-    assert_eq!(fs::read_dir(&local)?.count(), 1);
+    assert_eq!(fs::read(local.join("generated.log"))?, b"keep my output");
+    assert_eq!(fs::read_dir(&local)?.count(), 2);
     tags::toggle(&state, &work, &team, nested)?;
     assert!(!tags::load(&state, &team)?.contains_key(nested));
     assert!(tags::load(&source, &team)?.contains_key(nested));

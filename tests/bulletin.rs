@@ -43,10 +43,10 @@ fn draft_precedes_publication_and_buttons_share_actions() -> Result<(), std::con
         Some(BoardAction::OpenDraft(drafts[0].reference))
     );
     for (x, expected) in [
-        (10, BoardAction::Compose),
-        (20, BoardAction::Preferences),
-        (36, BoardAction::Workspace),
-        (52, BoardAction::Filter),
+        (5, BoardAction::Compose),
+        (15, BoardAction::Workspace),
+        (25, BoardAction::Filter),
+        (35, BoardAction::Preferences),
     ] {
         board.handle(key(KeyCode::Tab), area, &rows);
         terminal.draw(|f| board.render(f, &rows))?;
@@ -55,7 +55,7 @@ fn draft_precedes_publication_and_buttons_share_actions() -> Result<(), std::con
             Some(&expected)
         );
         assert_eq!(
-            board.handle(click(x, 7), area, &rows).as_ref(),
+            board.handle(click(x, 6), area, &rows).as_ref(),
             Some(&expected)
         );
     }
@@ -87,11 +87,8 @@ fn quick_reply_targets_the_selected_published_letter() {
     let rows = BoardRows::new(&[], &letters);
     let mut board = Bulletin::default();
     let area = Rect::new(0, 0, 60, 8);
-    for _ in 0..5 {
-        board.handle(Event::Key(KeyCode::Tab.into()), area, &rows);
-    }
     assert_eq!(
-        board.handle(Event::Key(KeyCode::Enter.into()), area, &rows),
+        board.handle(Event::Key(KeyCode::Char('r').into()), area, &rows),
         Some(BoardAction::QuickReply("letter-18".into()))
     );
 }
@@ -109,11 +106,12 @@ fn arrows_reach_actions_from_both_ends_of_the_list() {
         );
     }
     for (direction, expected) in [
-        (KeyCode::Down, BoardAction::Preferences),
+        (KeyCode::Down, BoardAction::Filter),
+        (KeyCode::Left, BoardAction::Workspace),
         (KeyCode::Left, BoardAction::Compose),
-        (KeyCode::Right, BoardAction::Preferences),
         (KeyCode::Right, BoardAction::Workspace),
         (KeyCode::Right, BoardAction::Filter),
+        (KeyCode::Right, BoardAction::Preferences),
     ] {
         board.handle(Event::Key(direction.into()), area, &rows);
         assert_eq!(

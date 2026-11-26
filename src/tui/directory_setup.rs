@@ -24,11 +24,12 @@ pub(super) enum Action<'a> {
     Finish(&'a Path, &'a Path),
 }
 
-fn layout(area: Rect) -> [Rect; 4] {
+fn layout(area: Rect) -> [Rect; 5] {
     Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(super::page("", ThemeColor::default()).inner(area))
@@ -38,11 +39,11 @@ impl DirectorySetup {
     pub fn render(&self, frame: &mut Frame<'_>, color: ThemeColor) {
         let area = frame.area();
         frame.render_widget(super::page("首次设置", color), area);
-        let [state, work, status, finish] = layout(area);
+        let [state, work, status, finish, footer] = layout(area);
         for (index, (label, rect)) in [
             ("本机状态目录", state),
             ("队伍工作目录", work),
-            ("完成配置", finish),
+            ("1 完成配置", finish),
         ]
         .into_iter()
         .enumerate()
@@ -67,6 +68,14 @@ impl DirectorySetup {
                 rect,
             );
         }
+        frame.render_widget(
+            Paragraph::new(if self.focus == 2 {
+                "enter · 完成配置"
+            } else {
+                "enter · 选择文件夹"
+            }),
+            footer,
+        );
         let hint = if self.status.is_empty() {
             match self.focus {
                 0 => "选择一个文件夹，让 SYNOD 在这台电脑上保存草稿和同步记录. ",
@@ -91,18 +100,19 @@ impl DirectorySetup {
         match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 code if let Some(next) = super::focus_step(code, self.focus, 3, &{
-                    let [a, b, _, c] = layout(area);
+                    let [a, b, _, c, _] = layout(area);
                     [(0, a), (1, b), (2, c)]
                 }) =>
                 {
                     self.focus = next;
                     return Action::Stay;
                 }
+                _ if super::shortcut(k, 1, false).is_some() => self.focus = 2,
                 KeyCode::Enter => {}
                 _ => return Action::Stay,
             },
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-                let [state, work, _, finish] = layout(area);
+                let [state, work, _, finish, _] = layout(area);
                 let Some(index) = [state, work, finish]
                     .iter()
                     .position(|rect| rect.contains(Position::new(m.column, m.row)))
@@ -175,7 +185,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            screen.handle(click(9, left), area, || Ok(None)),
+            screen.handle(click(8, left), area, || Ok(None)),
             Action::Finish(..)
         ));
         assert!(matches!(
@@ -206,7 +216,7 @@ mod tests {
         terminal
             .draw(|f| setup.render(f, ThemeColor::default()))
             .unwrap();
-        assert_eq!(terminal.backend().buffer()[(19, 9)].symbol(), "完");
+        assert_eq!(terminal.backend().buffer()[(20, 8)].symbol(), "完");
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "首");
         assert!(
@@ -215,10 +225,13 @@ mod tests {
                 .contains(ratatui::style::Modifier::BOLD)
         );
         assert_eq!(buffer[(0, 0)].fg, ThemeColor::default().rgb());
-        assert!((0..46).all(|x| buffer[(x, 1)].symbol() == " "));
+        assert!(
+            (0..46).all(|x| buffer[(x, 1)].symbol() == "─"
+                && buffer[(x, 1)].fg == ThemeColor::default().rgb())
+        );
         assert_eq!(buffer[(45, 0)].symbol(), " ");
-        assert_eq!(buffer[(0, 9)].bg, buffer[(45, 9)].bg);
-        assert_eq!(buffer[(0, 9)].bg, ratatui::style::Color::Rgb(154, 176, 194));
+        assert_eq!(buffer[(0, 8)].bg, buffer[(45, 8)].bg);
+        assert_eq!(buffer[(0, 8)].bg, ratatui::style::Color::Rgb(154, 176, 194));
         Ok(())
     }
 }

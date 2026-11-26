@@ -634,7 +634,12 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     Err(io::Error::other("Remote branch advanced; retry this send"))
 }
 
-pub(super) fn copy_workspace(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn copy_workspace(
+    from: &Path,
+    to: &Path,
+    work: &Path,
+    ignored: &super::ignored::Ignored,
+) -> io::Result<()> {
     use std::fs;
     if !fs::symlink_metadata(from)?.is_dir() {
         return Err(io::Error::other("Select an ordinary workspace directory"));
@@ -642,6 +647,9 @@ pub(super) fn copy_workspace(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
+        if ignored.excludes(entry.path().strip_prefix(work).map_err(io::Error::other)?) {
+            continue;
+        }
         let name = entry.file_name();
         if name.to_string_lossy().eq_ignore_ascii_case(".git")
             || name.to_string_lossy().starts_with(".synod-sync-")
@@ -651,7 +659,7 @@ pub(super) fn copy_workspace(from: &Path, to: &Path) -> io::Result<()> {
         let target = to.join(name);
         let ty = entry.file_type()?;
         if ty.is_dir() {
-            copy_workspace(&entry.path(), &target)?
+            copy_workspace(&entry.path(), &target, work, ignored)?
         } else if ty.is_file() {
             fs::copy(entry.path(), target)?;
         } else {
@@ -860,7 +868,12 @@ pub fn workspace_action(
         }
         fs::remove_dir_all(&sub)?;
     }
-    copy_workspace(&local, &sub)?;
+    let mut tracked = super::ignored::Ignored::tracked(&dir, "HEAD")?;
+    if has_personal {
+        tracked.extend(super::ignored::Ignored::tracked(&dir, "published")?);
+    }
+    let ignored = super::ignored::Ignored::read(work, &dir.join(".git"), tracked)?;
+    copy_workspace(&local, &sub, work, &ignored)?;
     if !git(&dir, &["ls-files", "-z", "--", &prefix])?.is_empty()
         || fs::read_dir(&sub)?.next().is_some()
     {
@@ -876,6 +889,25 @@ pub fn workspace_action(
         git(&dir, &["push", "--", remote, &format!("HEAD:{personal}")])?;
     } else if !has_personal && matches!(action, A::Save | A::SaveAndSubmit) {
         git(&dir, &["push", "--", remote, &format!("HEAD:{personal}")])?;
+    }
+    if dirty || !has_personal {
+        let cache = base.join("repo.git");
+        fs::create_dir_all(&cache)?;
+        git(&cache, &["init", "--bare"])?;
+        let path = dir
+            .to_str()
+            .ok_or_else(|| io::Error::other("Invalid local candidate path"))?;
+        git(
+            &cache,
+            &[
+                "fetch",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--",
+                path,
+                &format!("+HEAD:refs/synod/personal/{actor}/{key}"),
+            ],
+        )?;
     }
     if matches!(action, A::Save) {
         return Ok(R::Saved);

@@ -128,6 +128,19 @@ pub fn toggle(state: &Path, work: &Path, team: &NewTeam, name: &str) -> io::Resu
         {
             return Err(io::Error::other("子工作区之间不能嵌套"));
         }
+        let area = state
+            .join("teams")
+            .join(team.id())
+            .join("spaces")
+            .join(key(name))
+            .join("sync");
+        if area.is_dir() {
+            let _mode_guard = lock(&area)?;
+            match fs::remove_file(area.join("mode.json")) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+        }
         tags.insert(name.into(), name.into());
     }
     save(&state.join("teams").join(team.id()), &tags)?;

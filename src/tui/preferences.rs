@@ -147,7 +147,7 @@ impl ThemeForm {
                 self.editor.active(),
             );
         }
-        let button = Paragraph::new("应用设置");
+        let button = Paragraph::new("1 应用设置").centered();
         frame.render_widget(
             if self.focus == 3 {
                 button.style(self.editor.active().highlight())
@@ -178,6 +178,9 @@ impl ThemeForm {
                 }
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                _ if super::shortcut(key, 1, self.focus < 3).is_some() => {
+                    self.editor.apply(save)?
+                }
                 KeyCode::Esc => return Ok(SettingsAction::Back),
                 code if let Some(next) = super::focus_step(
                     code,
