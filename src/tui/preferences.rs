@@ -17,7 +17,10 @@ impl ThemeColor {
     }
     pub(super) fn highlight(self) -> Style {
         let [r, g, b] = self.0;
-        Style::default().bg(Color::Rgb(r, g, b))
+        let light = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) >= 128000;
+        Style::default()
+            .bg(self.rgb())
+            .fg(if light { Color::Black } else { Color::White })
     }
 }
 

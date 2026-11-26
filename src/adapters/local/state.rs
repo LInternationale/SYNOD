@@ -58,7 +58,15 @@ pub fn system_config_file() -> io::Result<PathBuf> {
 impl ClientConfig {
     pub fn read(path: &Path) -> io::Result<Self> {
         match File::open(path) {
-            Ok(file) => Ok(serde_json::from_reader(file)?),
+            Ok(file) => {
+                let mut config: Self = serde_json::from_reader(file)?;
+                if config.theme_rgb == [70, 93, 112]
+                    && config.fields.get("custom_theme").and_then(|v| v.as_bool()) != Some(true)
+                {
+                    config.theme_rgb = default_rgb()
+                }
+                Ok(config)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }

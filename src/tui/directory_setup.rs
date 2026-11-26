@@ -218,7 +218,7 @@ mod tests {
         assert!((0..46).all(|x| buffer[(x, 1)].symbol() == " "));
         assert_eq!(buffer[(45, 0)].symbol(), " ");
         assert_eq!(buffer[(0, 9)].bg, buffer[(45, 9)].bg);
-        assert_eq!(buffer[(0, 9)].bg, ratatui::style::Color::Rgb(70, 93, 112));
+        assert_eq!(buffer[(0, 9)].bg, ratatui::style::Color::Rgb(154, 176, 194));
         Ok(())
     }
 }

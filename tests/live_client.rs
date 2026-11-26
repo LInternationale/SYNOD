@@ -248,3 +248,72 @@ fn workspace_save_submit_and_defer_preserve_branch_boundaries() -> io::Result<()
     assert_eq!(show("main:workspace/code/result")?.stdout, b"alice");
     fs::remove_dir_all(root)
 }
+
+#[test]
+fn cloud_drafts_survive_device_changes_and_diverging_edits() -> io::Result<()> {
+    use synod::{
+        adapters::git::drafts,
+        application::letters::{Attachment, Draft},
+    };
+    let root = std::env::temp_dir().join(format!("synod-cloud-test-{}", std::process::id()));
+    fs::create_dir(&root)?;
+    let bare = root.join("remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .output()?
+            .status
+            .success()
+    );
+    let repo = bare.to_str().expect("fixture path");
+    let team: NewTeam = serde_json::from_str(include_str!("fixtures/v1/team/team.json"))?;
+    let (a, b) = (root.join("a"), root.join("b"));
+    let actor = "member-alice";
+    operations::publish_initial(&a, repo, &team, &operations::freeze_initial(actor)?)?;
+    let first = Draft {
+        title: "Unsynced research".into(),
+        body: "First draft".into(),
+        to: "member-chen".into(),
+        attachments: vec![Attachment {
+            filename: "图.png".into(),
+            bytes: vec![0, 255],
+        }],
+        ..Default::default()
+    };
+    let operation = |d| operations::FrozenSend::new(actor, team.id(), d);
+    let initial = operation(first)?;
+    let primary = drafts::save(&a, &team, repo, &initial)?;
+    assert_eq!(drafts::save(&a, &team, repo, &initial)?, primary);
+    let (mut found, _) = drafts::discover(&b, &team, repo, actor)?;
+    assert_eq!(found.len(), 1);
+    let mut second = found.pop().unwrap();
+    assert_eq!(second.attachments[0].bytes, [0, 255]);
+    assert_eq!(second.cloud.as_ref(), Some(&primary));
+    let mut left = second.clone();
+    left.body = "From A".into();
+    drafts::save(&a, &team, repo, &operation(left)?)?;
+    second.body = "From B".into();
+    let stale = operation(second)?;
+    let fork = drafts::save(&b, &team, repo, &stale)?;
+    assert_ne!(fork.copy, primary.copy);
+    assert_eq!(drafts::save(&b, &team, repo, &stale)?, fork);
+    let (all, _) = drafts::discover(&a, &team, repo, actor)?;
+    assert_eq!(all.len(), 2);
+    assert!(
+        drafts::discover(&a, &team, repo, "member-bob")?
+            .0
+            .is_empty()
+    );
+    let sent = operation(
+        all.into_iter()
+            .find(|d| d.body == "From B")
+            .expect("conflict copy"),
+    )?;
+    operations::send_letter(&a, &team, repo, &sent)?;
+    let after = drafts::discover(&b, &team, repo, actor)?;
+    assert!(after.1.contains(&(fork.letter, fork.copy)));
+    assert_eq!(after.0.len(), 1);
+    assert_eq!(after.0[0].body, "From A");
+    fs::remove_dir_all(root)
+}

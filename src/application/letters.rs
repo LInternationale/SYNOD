@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Draft {
     pub reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudDraft>,
     pub title: String,
     pub to: String,
     pub cc: String,
@@ -45,4 +47,12 @@ impl Draft {
             ..Self::default()
         }
     }
+}
+
+/// Remote revision observed when this draft copy was saved or opened.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CloudDraft {
+    pub letter: String,
+    pub copy: String,
+    pub revision: String,
 }

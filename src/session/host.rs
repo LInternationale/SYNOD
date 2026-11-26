@@ -314,50 +314,69 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 return Ok(Reply::Ready);
             }
             if let Request::SaveDraft(mut draft) = request {
-                let dir = if draft.reference.is_empty() {
-                    let mut serial = 1u64;
-                    loop {
-                        let id = format!("letter-local-{serial}");
-                        let dir = base.join(&id);
-                        match fs::create_dir(&dir) {
-                            Ok(()) => {
-                                draft.reference = id;
-                                break dir;
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => serial += 1,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                } else {
-                    if !draft
-                        .reference
-                        .strip_prefix("letter-local-")
-                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                    {
-                        return Err(io::Error::other("Invalid draft reference"));
-                    }
-                    let dir = base.join(&draft.reference);
-                    if !dir.is_dir() {
-                        return Err(io::Error::other("Unknown draft"));
-                    }
-                    dir
+                let copy = editing_copy(&base, &mut draft)?;
+                let prior =
+                    read_optional::<operations::FrozenSend>(&copy.join("save-pending.json"))?;
+                let intent = match prior {
+                    Some(i) if i.draft == draft => i,
+                    _ => operations::FrozenSend::new(&team.human, team.team.id(), draft)?,
                 };
-                let copy = dir.join("primary");
-                fs::create_dir_all(&copy)?;
-                let tmp = copy.join("editing.tmp");
-                fs::write(&tmp, serde_json::to_vec(&draft)?)?;
-                fs::File::open(&tmp)?.sync_all()?;
-                fs::rename(tmp, copy.join("editing.json"))?;
-                return Ok(Reply::Saved(draft));
+                write_local(&copy.join("save-pending.json"), &intent)?;
+                write_local(&copy.join("editing.json"), &intent.draft)?;
+                return match finish_cloud_save(&roots.state, &team, &copy, &intent) {
+                    Ok(d) => Ok(Reply::Saved(d, None)),
+                    Err(e) => Ok(Reply::Saved(intent.draft, Some(e.to_string()))),
+                };
             }
-            let mut drafts = Vec::new();
-            for entry in fs::read_dir(base)? {
-                let path = entry?.path().join("primary/editing.json");
-                if path.is_file() && !path.with_file_name("sent").exists() {
-                    drafts.push(serde_json::from_slice(&fs::read(path)?)?)
+            let mut local = Vec::new();
+            for entry in fs::read_dir(&base)? {
+                let copy = entry?.path().join("primary");
+                if copy.join("sent").exists() {
+                    continue;
+                }
+                if let Some(intent) =
+                    read_optional::<operations::FrozenSend>(&copy.join("save-pending.json"))?
+                {
+                    let result = finish_cloud_save(&roots.state, &team, &copy, &intent);
+                    local.push((result.unwrap_or(intent.draft), copy));
+                } else if let Some(draft) = read_optional::<Draft>(&copy.join("editing.json"))? {
+                    local.push((draft, copy))
                 }
             }
-            Ok(Reply::Drafts(drafts))
+            let remote = crate::adapters::git::drafts::discover(
+                &roots.state,
+                &team.team,
+                &team.remote,
+                &team.human,
+            );
+            if let Ok((drafts, sent)) = remote {
+                local.retain(|(d, copy)| {
+                    copy.join("save-pending.json").exists()
+                        || !d
+                            .cloud
+                            .as_ref()
+                            .is_some_and(|c| sent.contains(&(c.letter.clone(), c.copy.clone())))
+                });
+                for mut draft in drafts {
+                    if let Some((stored, copy)) = local.iter_mut().find(|(d, _)| {
+                        d.cloud
+                            .as_ref()
+                            .zip(draft.cloud.as_ref())
+                            .is_some_and(|(a, b)| a.copy == b.copy && a.letter == b.letter)
+                    }) {
+                        if !copy.join("save-pending.json").exists() && stored.cloud != draft.cloud {
+                            draft.reference = stored.reference.clone();
+                            write_local(&copy.join("editing.json"), &draft)?;
+                            *stored = draft;
+                        }
+                    } else {
+                        let copy = editing_copy(&base, &mut draft)?;
+                        write_local(&copy.join("editing.json"), &draft)?;
+                        local.push((draft, copy))
+                    }
+                }
+            }
+            Ok(Reply::Drafts(local.into_iter().map(|(d, _)| d).collect()))
         }
         Request::WorkspaceAction { space, action } => {
             let profile = current.ok_or_else(|| io::Error::other("Team required"))?;
@@ -395,6 +414,69 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
         }
         _ => Err(io::Error::other("Unexpected request")),
     }
+}
+fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    match fs::File::open(path) {
+        Ok(f) => Ok(Some(serde_json::from_reader(f)?)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+fn write_local(path: &Path, value: &impl serde::Serialize) -> io::Result<()> {
+    let temp = path.with_extension("tmp");
+    let file = fs::File::create(&temp)?;
+    serde_json::to_writer(&file, value)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?
+    }
+    Ok(())
+}
+fn editing_copy(base: &Path, draft: &mut Draft) -> io::Result<std::path::PathBuf> {
+    if draft.reference.is_empty() {
+        for serial in 1..=u64::MAX {
+            let id = format!("letter-local-{serial}");
+            match fs::create_dir(base.join(&id)) {
+                Ok(()) => {
+                    draft.reference = id;
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    if !draft
+        .reference
+        .strip_prefix("letter-local-")
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return Err(io::Error::other("Invalid local draft reference"));
+    }
+    let dir = base.join(&draft.reference);
+    if !dir.is_dir() {
+        return Err(io::Error::other("Unknown local draft"));
+    }
+    let copy = dir.join("primary");
+    fs::create_dir_all(&copy)?;
+    Ok(copy)
+}
+fn finish_cloud_save(
+    root: &Path,
+    profile: &Profile,
+    copy: &Path,
+    intent: &operations::FrozenSend,
+) -> io::Result<Draft> {
+    let location =
+        crate::adapters::git::drafts::save(root, &profile.team, &profile.remote, intent)?;
+    let mut draft = intent.draft.clone();
+    draft.cloud = Some(location);
+    write_local(&copy.join("editing.json"), &draft)?;
+    fs::remove_file(copy.join("save-pending.json"))?;
+    Ok(draft)
 }
 fn save_profile(mut config: ClientConfig, file: &Path, p: Profile) -> io::Result<Reply> {
     config

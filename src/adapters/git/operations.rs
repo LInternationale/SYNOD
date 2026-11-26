@@ -64,7 +64,7 @@ pub fn freeze_initial(actor: &str) -> io::Result<InitialCommit> {
     })
 }
 
-fn git(dir: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
+pub(super) fn git(dir: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
     run(cmd)
@@ -269,6 +269,14 @@ pub struct FrozenSend {
 }
 
 impl FrozenSend {
+    pub(super) fn letter(&self) -> String {
+        self.draft
+            .cloud
+            .as_ref()
+            .map(|c| c.letter.clone())
+            .unwrap_or_else(|| format!("letter-{}", self.key))
+    }
+
     pub fn new(
         actor: &str,
         team: &str,
@@ -287,7 +295,7 @@ impl FrozenSend {
     }
 }
 
-fn commit_message(kind: &str, send: &FrozenSend, target: &str) -> io::Result<String> {
+pub(super) fn commit_message(kind: &str, send: &FrozenSend, target: &str) -> io::Result<String> {
     let quoted = |s: &str| toml::Value::String(s.to_owned()).to_string();
     let msg = format!(
         "kind = {}\n\nschema_version = 1\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n\n[target]\n{target}\n",
@@ -300,7 +308,7 @@ fn commit_message(kind: &str, send: &FrozenSend, target: &str) -> io::Result<Str
     super::commit_message::decode(&msg).map_err(|e| io::Error::other(format!("{e:?}")))?;
     Ok(msg)
 }
-fn commit(dir: &Path, msg: &str) -> io::Result<()> {
+pub(super) fn commit(dir: &Path, msg: &str) -> io::Result<()> {
     use std::{io::Write, process::Stdio};
     let mut process = Command::new("git")
         .arg("-C")
@@ -331,7 +339,7 @@ fn commit(dir: &Path, msg: &str) -> io::Result<()> {
     }
     Ok(())
 }
-fn originals(s: &FrozenSend) -> io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+pub(super) fn originals(s: &FrozenSend) -> io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
     use std::collections::BTreeMap;
     let mut files = BTreeMap::new();
     let mut attachments = Vec::new();
@@ -341,7 +349,7 @@ fn originals(s: &FrozenSend) -> io::Result<std::collections::BTreeMap<String, Ve
         files.insert(format!("attachments/{id}"), a.bytes.clone());
     }
     let cc: Vec<_> = s.draft.cc.split(',').filter(|v| !v.is_empty()).collect();
-    let env = serde_json::json!({"letter_id":format!("letter-{}",s.key),"from":s.actor,"to":s.draft.to,"cc":cc,"title":s.draft.title,"references":s.draft.references,"initial_dependencies":s.draft.dependencies,"attachments":attachments});
+    let env = serde_json::json!({"letter_id":s.letter(),"from":s.actor,"to":s.draft.to,"cc":cc,"title":s.draft.title,"references":s.draft.references,"initial_dependencies":s.draft.dependencies,"attachments":attachments});
     files.insert("envelope.json".into(), serde_json::to_vec_pretty(&env)?);
     files.insert("body.md".into(), s.draft.body.as_bytes().to_vec());
     Ok(files)
@@ -364,10 +372,18 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     {
         return Err(io::Error::other("Select a recipient and enter a title"));
     }
-    let letter = format!("letter-{}", s.key);
+    let letter = s.letter();
+    if let Some(c) = &s.draft.cloud {
+        super::drafts::validate(c)?;
+    }
     let event = format!("evt-{}", s.key);
     let prefix = format!("letters/{letter}");
-    let branch = format!("refs/heads/drafts/{}/{letter}/primary", s.actor);
+    let copy = s
+        .draft
+        .cloud
+        .as_ref()
+        .map_or("primary", |c| c.copy.as_str());
+    let branch = format!("refs/heads/drafts/{}/{letter}/{copy}", s.actor);
     let mut files = originals(s)?;
     let event_path = format!("events/{event}.json");
     let sent = serde_json::to_vec_pretty(
@@ -376,7 +392,7 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     let draft_msg = commit_message(
         "draft.saved",
         s,
-        &format!("letter_id = \"{letter}\"\ncopy_id = \"primary\""),
+        &format!("letter_id = \"{letter}\"\ncopy_id = \"{copy}\""),
     )?;
     let sent_msg = commit_message(
         "letter.sent",
@@ -450,12 +466,17 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
             git(&dir, &["rev-parse", "HEAD"])?
         } else {
             git(&dir, &["fetch", "--no-tags", "--", remote, &branch])?;
+            let observed = s
+                .draft
+                .cloud
+                .as_ref()
+                .map_or("FETCH_HEAD", |c| c.revision.as_str());
             for (path, bytes) in &files {
-                if git(&dir, &["show", &format!("FETCH_HEAD:{prefix}/{path}")])? != *bytes {
+                if git(&dir, &["show", &format!("{observed}:{prefix}/{path}")])? != *bytes {
                     return Err(io::Error::other("Cloud draft differs from frozen send"));
                 }
             }
-            git(&dir, &["rev-parse", "FETCH_HEAD"])?
+            git(&dir, &["rev-parse", observed])?
         };
         let draft_oid = std::str::from_utf8(&draft_oid)
             .map_err(io::Error::other)?

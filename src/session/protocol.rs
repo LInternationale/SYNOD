@@ -1,6 +1,6 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Hello(u8, String),
@@ -43,7 +43,7 @@ pub enum Reply {
     Ready,
     Team(Option<Profile>),
     Drafts(Vec<Draft>),
-    Saved(Draft),
+    Saved(Draft, Option<String>),
     Files(Vec<String>),
     Color([u8; 3]),
     Failure(String),

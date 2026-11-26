@@ -159,3 +159,15 @@ Implementation comparison: the shared title style and input renderer are used by
 In application-authored Chinese interface text replace U+3002 with U+002E followed by one U+0020, including at the end of a string. Review: a runtime replacement would also alter user-authored letters, so edit the owned literals and document the convention. Verify with a source scan and the existing test suite.
 
 All 20 occurrences in Rust source were replaced in the two setup views. The source scan found zero remaining U+3002 characters. Formatting, offline tests and nightly coverage completed successfully.
+
+## Cloud draft saves and discovery
+
+Keep exact editor bytes and an operation with a stable ID on disk before network I/O. A cloud location includes the letter ID, copy ID and observed Git object. New saves create the primary ref from main. Later saves advance the observed ref only by ordinary fast-forward push. A divergent save uses a deterministic copy named for its operation. Compare the tip's operation and frozen content on retry. Read drafts from the actor's refs, suppress already published letter IDs and preserve dirty local versions. Reuse original serialization and the saved letter ID on send. Report local persistence separately from remote acknowledgement.
+
+Independent review: local serial references cannot identify letters across devices. Keep them local, introduce independent cloud coordinates and validate every remote path component and object ID. A failed push must not generate multiple copies on retry. Cloud attachments use generated asset IDs, never user filenames as filesystem paths. Use isolated local-bare-remote tests for two clients, idempotent save and conflicting edits.
+
+## Lighter default theme
+
+Use #9AB0C2 for the default, with dark foreground on light selected backgrounds. Existing configurations serialized the old default even when the user never edited it. Migrate that exact legacy value on read; preserve other custom colors and record explicit future choices so users can still choose the older RGB. Verify first-run and legacy settings, explicit override and rendered focus text.
+
+Cloud and theme comparison: the local Git integration test used two state roots and a bare remote. It saved, rediscovered attachments, edited concurrently, retried the deterministic conflict copy and sent that copy, while the other unsent version remained discoverable. Local settings tests exercised the new default, legacy migration and an explicit old-color override. Offline tests passed; nightly overall branch coverage was 42.69%. Sync retries currently run when revisiting drafts; an autonomous session synchronization loop remains pending.

@@ -111,6 +111,7 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
                 Request::ApplyTheme(rgb) => {
                     let mut config = ClientConfig::read(&file)?;
                     config.theme_rgb = rgb;
+                    config.fields.insert("custom_theme".into(), true.into());
                     config.save(&file)?;
                     Ok(Reply::Color(rgb))
                 }

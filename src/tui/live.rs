@@ -659,10 +659,14 @@ fn compose(
                     continue;
                 }
                 match client.request(Request::SaveDraft(editing.clone())) {
-                    Ok(Reply::Saved(d)) => {
+                    Ok(Reply::Saved(d, pending)) => {
                         saved = d.clone();
                         editing = d;
-                        msg = "已存于本机".into();
+                        if let Some(reason) = pending {
+                            msg = format!("已存于本机，等待同步. {reason}");
+                            continue;
+                        }
+                        msg = "草稿已存至云端".into();
                         if send {
                             match client.request(Request::Send(saved.reference.clone())) {
                                 Ok(Reply::Ready) => return Ok(()),

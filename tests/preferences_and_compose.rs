@@ -8,7 +8,7 @@ use synod::tui::{
 #[test]
 fn form_applies_only_on_keyboard_or_mouse_activation() -> Result<(), std::convert::Infallible> {
     let initial = ThemeColor::default();
-    assert_eq!(initial.0, [70, 93, 112]);
+    assert_eq!(initial.0, [154, 176, 194]);
     let mut form = ThemeForm::new(initial);
     let area = Rect::new(0, 0, 32, 8);
     let mut terminal = Terminal::new(TestBackend::new(32, 8))?;
@@ -53,7 +53,7 @@ fn form_applies_only_on_keyboard_or_mouse_activation() -> Result<(), std::conver
         form.handle(Event::Key(KeyCode::Esc.into()), area, &mut save),
         Ok(SettingsAction::Back)
     );
-    assert_eq!(saved, [ThemeColor([21, 93, 112]); 2]);
+    assert_eq!(saved, [ThemeColor([21, 176, 194]); 2]);
     Ok(())
 }
 
@@ -78,15 +78,19 @@ fn system_preferences_roundtrip_preserves_other_keys() -> std::io::Result<()> {
     let root = std::env::temp_dir().join(format!("synod-config-test-{}", std::process::id()));
     std::fs::create_dir(&root)?;
     let path = root.join("client.json");
-    assert_eq!(ClientConfig::read(&path)?.theme_rgb, [70, 93, 112]);
+    assert_eq!(ClientConfig::read(&path)?.theme_rgb, [154, 176, 194]);
     std::fs::write(&path, br#"{"existing":"keep"}"#)?;
     let mut config = ClientConfig::read(&path)?;
-    assert_eq!(config.theme_rgb, [70, 93, 112]);
+    assert_eq!(config.theme_rgb, [154, 176, 194]);
     config.theme_rgb = [5, 6, 7];
     config.save(&path)?;
     let loaded = ClientConfig::read(&path)?;
     assert_eq!(loaded.fields["existing"], "keep");
     assert_eq!(loaded.theme_rgb, [5, 6, 7]);
+    std::fs::write(&path, br#"{"theme_rgb":[70,93,112]}"#)?;
+    assert_eq!(ClientConfig::read(&path)?.theme_rgb, [154, 176, 194]);
+    std::fs::write(&path, br#"{"theme_rgb":[70,93,112],"custom_theme":true}"#)?;
+    assert_eq!(ClientConfig::read(&path)?.theme_rgb, [70, 93, 112]);
     std::fs::write(&path, b"{")?;
     assert!(ClientConfig::read(&path).is_err());
     std::fs::remove_file(path)?;
