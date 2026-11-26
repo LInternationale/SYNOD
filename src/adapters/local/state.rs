@@ -15,6 +15,8 @@ use std::{
 pub struct ClientConfig {
     #[serde(default = "default_rgb")]
     pub theme_rgb: [u8; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_team: Option<crate::application::setup::PendingTeam>,
     #[serde(flatten)]
     pub fields: BTreeMap<String, serde_json::Value>,
 }
@@ -27,6 +29,7 @@ impl Default for ClientConfig {
         Self {
             theme_rgb: default_rgb(),
             fields: BTreeMap::new(),
+            pending_team: None,
         }
     }
 }

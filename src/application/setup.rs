@@ -1,28 +1,28 @@
 //! Data frozen by the new-team wizard before publishing team.json.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum MemberKind {
     Human,
     Assistant,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Member {
     actor_id: String,
     kind: MemberKind,
     display_name: String,
 }
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Space {
     space_id: String,
     display_name: String,
 }
 
 /// Initial team configuration, in the repository's version-one wire format.
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct NewTeam {
     schema_version: u8,
     team_id: String,
@@ -92,6 +92,33 @@ impl NewTeam {
             team_id: team_id.into(),
             members,
             spaces,
+        })
+    }
+}
+
+/// A local-only initial manifest waiting for an identity and remote confirmation.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PendingTeam {
+    manifest: NewTeam,
+}
+
+pub struct InitialPublication<'a> {
+    pub manifest: &'a NewTeam,
+    pub actor_id: &'a str,
+}
+
+impl PendingTeam {
+    pub fn new(manifest: NewTeam) -> Self {
+        Self { manifest }
+    }
+
+    /// Prepare the initial publication only for a bound member of this team.
+    pub fn publication_for(&self, bound_actor: Option<&str>) -> Option<InitialPublication<'_>> {
+        let actor = bound_actor?;
+        let member = self.manifest.members.iter().find(|m| m.actor_id == actor)?;
+        Some(InitialPublication {
+            manifest: &self.manifest,
+            actor_id: &member.actor_id,
         })
     }
 }
