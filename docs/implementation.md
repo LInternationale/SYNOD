@@ -153,3 +153,9 @@ Independent review: use the current applied theme on letter detail as well as th
 Only Tab and BackTab cycle through controls. Arrows choose the nearest control beyond the corresponding edge of the focused rectangle, preferring overlapping rows or columns. Vertical lists scroll through entries and horizontal action bars traverse left/right. At an edge keep focus. Use the same control bounds as mouse interaction. Replace the combined repository form with sequential owner, repository address name, work areas, visibility and final review steps. Present one decision and explanation at a time, preserve values across Escape and review, and request remote creation only on final confirmation. Retain the earlier directory configuration page and independent optional member step.
 
 Implementation comparison: the shared title style and input renderer are used by the live forms, RGB editor and board pages. The drawing and navigation tests check bold color, the empty row, caret contrast on wrapped wide text, and horizontal/vertical focus boundaries. The isolated PTY run traversed all five repository creation steps, returned from review to change visibility, and verified retained owner, repository and workspace names. It stopped before creation. Full offline tests passed. Nightly measured 272/654 workspace branches (41.59%), excluding the external PTY run.
+
+## TUI sentence punctuation
+
+In application-authored Chinese interface text replace U+3002 with U+002E followed by one U+0020, including at the end of a string. Review: a runtime replacement would also alter user-authored letters, so edit the owned literals and document the convention. Verify with a source scan and the existing test suite.
+
+All 20 occurrences in Rust source were replaced in the two setup views. The source scan found zero remaining U+3002 characters. Formatting, offline tests and nightly coverage completed successfully.

@@ -422,7 +422,7 @@ fn registration(
 }
 fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<()> {
     let mut menu = Form::new("队伍设置", vec![], &["新建队伍", "加入已有队伍"]);
-    menu.help = "如果你是第一个开始协作的人，选择「新建队伍」。队友已建好队伍并发给你 GitHub 链接时，选择「加入已有队伍」。";
+    menu.help = "如果你是第一个开始协作的人，选择「新建队伍」. 队友已建好队伍并发给你 GitHub 链接时，选择「加入已有队伍」. ";
     loop {
         let choice = menu.interact(t, c, "")?;
         match choice {
@@ -435,7 +435,7 @@ fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<()> {
             Action::Button(_) => {
                 let mut form =
                     Form::new("加入已有队伍", vec![field("队伍仓库链接", "")], &["加入"]);
-                form.help = "粘贴队友发给你的仓库链接，格式为 https://github.com/账号/仓库名。";
+                form.help = "粘贴队友发给你的仓库链接，格式为 https://github.com/账号/仓库名. ";
                 let mut msg = String::new();
                 loop {
                     if matches!(form.interact(t, c, &msg)?, Action::Back) {
@@ -458,25 +458,25 @@ fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> i
         vec![field("GitHub 用户名或组织名", "")],
         &["下一步"],
     );
-    owner.help = "队伍的信件和文件会保存在 GitHub 上。填写你的 GitHub 用户名，或你可以创建仓库的组织名。比如个人主页是 github.com/alice，就填 alice。";
+    owner.help = "队伍的信件和文件会保存在 GitHub 上. 填写你的 GitHub 用户名，或你可以创建仓库的组织名. 比如个人主页是 github.com/alice，就填 alice. ";
     let mut name = Form::new(
         "新建队伍 · 2/5 · 给队伍仓库起名",
         vec![field("仓库名", "")],
         &["下一步"],
     );
-    name.help = "仓库是队伍在 GitHub 上存放数据的地方。名称会成为网址的一部分，例如 contest-team。可用英文字母、数字、短横线、下划线和点。";
+    name.help = "仓库是队伍在 GitHub 上存放数据的地方. 名称会成为网址的一部分，例如 contest-team. 可用英文字母、数字、短横线、下划线和点. ";
     let mut spaces = Form::new(
         "新建队伍 · 3/5 · 划分共享工作区",
         vec![field("工作区名称", "")],
         &["下一步"],
     );
-    spaces.help = "哪些工作需要分开保存、提交和同步？例如填「代码，论文」就有两个工作区。用逗号隔开，暂时不需要可以留空。";
+    spaces.help = "哪些工作需要分开保存、提交和同步？例如填「代码，论文」就有两个工作区. 用逗号隔开，暂时不需要可以留空. ";
     let mut access = Form::new(
         "新建队伍 · 4/5 · 谁能查看队伍数据",
         vec![],
         &["仅有权限的人", "任何人"],
     );
-    access.help = "选择「仅有权限的人」，只有获准访问这个 GitHub 仓库的人能查看。选择「任何人」，互联网上的任何人都能查看队伍的信件、草稿、附件和共享文件。";
+    access.help = "选择「仅有权限的人」，只有获准访问这个 GitHub 仓库的人能查看. 选择「任何人」，互联网上的任何人都能查看队伍的信件、草稿、附件和共享文件. ";
     let mut step = 0usize;
     let mut public = false;
     let mut error = String::new();
@@ -489,7 +489,7 @@ fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> i
             .map(str::to_owned)
             .collect();
         let overview = format!(
-            "队伍数据将存放在 github.com/{}/{}\n可查看数据的人：{}\n共享工作区：{}\n创建后，再添加本机要使用的人类和 AI 身份。",
+            "队伍数据将存放在 github.com/{}/{}\n可查看数据的人：{}\n共享工作区：{}\n创建后，再添加本机要使用的人类和 AI 身份. ",
             owner.val(0),
             name.val(0),
             if public {
@@ -525,13 +525,13 @@ fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> i
         };
         match step {
             0 if RepositoryRequest::new(&owner.val(0), "team", Visibility::Private).is_err() => {
-                error = "请填写 GitHub 用户名或组织名，例如 alice。".into();
+                error = "请填写 GitHub 用户名或组织名，例如 alice. ".into();
                 continue;
             }
             1 if RepositoryRequest::new(&owner.val(0), &name.val(0), Visibility::Private)
                 .is_err() =>
             {
-                error = "请填写可以用在仓库网址里的名称，例如 contest-team。".into();
+                error = "请填写可以用在仓库网址里的名称，例如 contest-team. ".into();
                 continue;
             }
             3 => public = choice == 1,
