@@ -158,6 +158,11 @@ impl LetterEditor {
                     f.set_cursor_position((x, subject.y));
                 }
                 bounds.push((0, subject));
+                let viewport = view;
+                let view = Rect {
+                    width: view.width.saturating_sub(1),
+                    ..view
+                };
                 lines = visual_lines(&d.body, usize::from(view.width.max(1)));
                 cursor_row = lines
                     .partition_point(|line| line.start <= self.caret)
@@ -177,6 +182,7 @@ impl LetterEditor {
                     self.offset = self.offset.min(y).max((y + 1).saturating_sub(page));
                 }
                 self.offset = self.offset.min(max_offset);
+                super::scroll_gutter(f, viewport, self.offset, max_offset, color);
                 let rect = |y: usize| {
                     (y >= self.offset && y < self.offset + usize::from(view.height)).then(|| {
                         Rect::new(view.x, view.y + (y - self.offset) as u16, view.width, 1)

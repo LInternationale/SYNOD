@@ -218,6 +218,39 @@ fn discover_at(
 }
 
 pub fn save(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) -> io::Result<CloudDraft> {
+    save_observed(root, team, remote, s, &mut |_| Ok(()))
+}
+pub(crate) fn save_observed(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    s: &FrozenSend,
+    ready: &mut dyn FnMut(CloudDraft) -> io::Result<()>,
+) -> io::Result<CloudDraft> {
+    prepare_or_publish(root, team, remote, s, Some(ready))
+}
+pub(super) fn prepare_for_send(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    s: &FrozenSend,
+) -> io::Result<(std::path::PathBuf, CloudDraft)> {
+    let draft = prepare_or_publish(root, team, remote, s, None)?;
+    Ok((candidate_directory(root, team, s), draft))
+}
+fn candidate_directory(root: &Path, team: &NewTeam, s: &FrozenSend) -> std::path::PathBuf {
+    root.join("teams")
+        .join(team.id())
+        .join("worktrees")
+        .join(format!("save-{}", s.key))
+}
+fn prepare_or_publish(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    s: &FrozenSend,
+    mut publish: Option<&mut dyn FnMut(CloudDraft) -> io::Result<()>>,
+) -> io::Result<CloudDraft> {
     team.validate()?;
     if team.id() != s.team || !safe(&s.key) || (!team.human(&s.actor) && !team.assistant(&s.actor))
     {
@@ -230,11 +263,7 @@ pub fn save(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) -> io::Re
     let original = s.draft.cloud.as_ref();
     let primary = original.map_or("primary", |c| c.copy.as_str());
     let fork = format!("copy-{}", s.key);
-    let dir = root
-        .join("teams")
-        .join(team.id())
-        .join("worktrees")
-        .join(format!("save-{}", s.key));
+    let dir = candidate_directory(root, team, s);
     fs::create_dir_all(&dir)?;
     git(&dir, &["init"])?;
     git(&dir, &["config", "user.name", &s.actor])?;
@@ -321,6 +350,16 @@ pub fn save(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) -> io::Re
         let oid = decode(git(&dir, &["rev-parse", "HEAD"])?)?
             .trim()
             .to_owned();
+        let candidate = CloudDraft {
+            letter: letter.clone(),
+            copy: copy.into(),
+            revision: oid.clone(),
+        };
+        if let Some(ready) = publish.as_mut() {
+            ready(candidate)?
+        } else {
+            return Ok(candidate);
+        }
         match git(&dir, &["push", "--", remote, &format!("HEAD:{reference}")]) {
             Ok(_) => {
                 if tip(&dir, remote, &reference)?.as_deref() == Some(&oid) {

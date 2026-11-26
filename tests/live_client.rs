@@ -300,6 +300,15 @@ fn workspace_save_submit_and_defer_preserve_branch_boundaries() -> io::Result<()
     let action =
         |actor, a| operations::workspace_action(&root, &work, &team, remote, actor, "code", a);
     assert_eq!(action("member-alice", A::Submit)?, R::Dirty);
+    use std::os::unix::fs::PermissionsExt;
+    let reject = bare.join("hooks/pre-receive");
+    fs::write(&reject, "#!/bin/sh\nexit 1\n")?;
+    fs::set_permissions(&reject, fs::Permissions::from_mode(0o700))?;
+    assert!(action("member-alice", A::Save).is_err());
+    fs::remove_file(reject)?;
+    fs::write(&local, "later edit")?;
+    assert_eq!(action("member-alice", A::Submit)?, R::Dirty);
+    fs::write(&local, "first")?;
     assert_eq!(action("member-alice", A::Save)?, R::Saved);
     let show = |spec: &str| {
         Command::new("git")
@@ -497,6 +506,48 @@ fn idle_session_fetches_and_retains_the_verified_board_offline() -> io::Result<(
         .join(team.id())
         .join("verified-board.json");
     wait(|| fs::read_to_string(&cache).is_ok_and(|s| s.contains("idle arrival")))?;
+    // Hold the remote receive hook until the client has acknowledged its local commit.
+    use std::os::unix::fs::PermissionsExt;
+    let Reply::Saved(mut edited, None) =
+        client.request(Request::SaveDraft(synod::application::letters::Draft {
+            title: "Local before remote".into(),
+            to: "member-alice".into(),
+            ..Default::default()
+        }))?
+    else {
+        return Err(io::Error::other("Missing cloud draft"));
+    };
+    edited.body = "Changed after saving".into();
+    let hook = remote.join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nwhile test ! -f hooks/release; do sleep 0.05; done\n",
+    )?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+    let mut sender = Client::connect(&roots.state)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let publish = std::thread::spawn(move || {
+        let reply = sender.request(Request::Background(
+            synod::session::protocol::BackgroundWrite::Send(edited),
+        ));
+        let _ = tx.send(matches!(reply, Ok(Reply::Committed)));
+    });
+    let receipt = rx.recv_timeout(Duration::from_secs(10));
+    let status = client.request(Request::PublicationStatus);
+    let view = client.request(Request::Board);
+    fs::write(remote.join("hooks/release"), [])?;
+    publish.join().unwrap();
+    assert_eq!(receipt, Ok(true));
+    assert!(matches!(
+        status,
+        Ok(Reply::PublicationStatus(
+            synod::session::protocol::PublicationState::Pushing
+        ))
+    ));
+    assert!(
+        matches!(view,Ok(Reply::Board{letters,..}) if letters.iter().all(|l|l.title!="Local before remote"))
+    );
+    wait(|| fs::read_to_string(&cache).is_ok_and(|s| s.contains("Local before remote")))?;
     fs::rename(&remote, root.join("offline.git"))?;
     wait(|| {
         matches!(
@@ -507,7 +558,11 @@ fn idle_session_fetches_and_retains_the_verified_board_offline() -> io::Result<(
     let Reply::Published(letters) = client.request(Request::Published)? else {
         panic!("missing board")
     };
-    assert!(letters[0].unread);
+    assert!(
+        letters
+            .iter()
+            .any(|l| l.title == "idle arrival" && l.unread)
+    );
     drop(client);
     handle.join().unwrap()?;
     fs::remove_dir_all(root)

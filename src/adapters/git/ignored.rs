@@ -69,6 +69,7 @@ impl Ignored {
                     "--format=%(objectname)",
                     "refs/synod/verified-main",
                     "refs/synod/personal",
+                    "refs/synod/push",
                 ],
             )?;
             for rev in std::str::from_utf8(&commits)

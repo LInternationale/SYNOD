@@ -25,7 +25,47 @@ use std::{
     io::{self, Stdout},
     path::Path,
 };
-pub(super) type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(super) struct Term {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    status: Option<Client>,
+}
+impl Term {
+    fn clear(&mut self) -> io::Result<()> {
+        self.terminal.clear()
+    }
+    pub(super) fn draw(
+        &mut self,
+        render: impl FnOnce(&mut ratatui::Frame<'_>),
+    ) -> io::Result<ratatui::CompletedFrame<'_>> {
+        let status = match &mut self.status {
+            Some(client) => match client.request(Request::PublicationStatus)? {
+                Reply::PublicationStatus(state) => match state {
+                    PublicationState::Idle => "就绪".into(),
+                    PublicationState::Pushing => "正在推送".into(),
+                    PublicationState::Confirmed => "已同步".into(),
+                    PublicationState::Failed(reason) => {
+                        format!("同步未完成 · {}", reason.lines().next().unwrap_or_default())
+                    }
+                },
+                _ => return Err(io::Error::other("Missing publication status")),
+            },
+            None => String::new(),
+        };
+        self.terminal.draw(|f| {
+            render(f);
+            if !status.is_empty() && !f.area().is_empty() {
+                let text = format!(" 当前状态 · {status}");
+                let area = f.area();
+                let width = (ratatui::text::Span::raw(&text)
+                    .width()
+                    .min(usize::from(area.width) / 2)) as u16;
+                let rect = Rect::new(area.right() - width, area.bottom() - 1, width, 1);
+                f.render_widget(ratatui::widgets::Clear, rect);
+                f.render_widget(Paragraph::new(text).right_aligned(), rect);
+            }
+        })
+    }
+}
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
@@ -39,6 +79,9 @@ impl Drop for Restore {
     }
 }
 pub(super) fn input() -> io::Result<Event> {
+    if !event::poll(std::time::Duration::from_secs(1))? {
+        return Ok(Event::FocusGained);
+    }
     let e = event::read()?;
     if matches!(e,Event::Key(k) if k.code==KeyCode::Char('c')&&k.modifiers.contains(KeyModifiers::CONTROL))
     {
@@ -243,7 +286,10 @@ pub fn run(file: &Path) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let _guard = Restore;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut term = Term {
+        terminal: Terminal::new(CrosstermBackend::new(io::stdout()))?,
+        status: None,
+    };
     match app(&mut term, file) {
         Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
         r => r,
@@ -271,6 +317,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
         }
     };
     let mut client = Client::connect(&roots.state)?;
+    t.status = Some(Client::connect(&roots.state)?);
     let mut color = handshake(&mut client)?;
     let new_profile = matches!(client.request(Request::Profile)?, Reply::Team(None));
     if new_profile {
@@ -283,16 +330,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
     }
     let mut board = Bulletin::default();
     let mut filter = [false; 2];
-    let mut last_error = None;
     'refresh: loop {
-        if let Reply::SyncStatus(error) = client.request(Request::SyncStatus)? {
-            if error != last_error
-                && let Some(e) = &error
-            {
-                notice(t, color, &format!("后台同步未完成：{e}"))?;
-            }
-            last_error = error;
-        }
         let Reply::Board {
             actor,
             letters: published,
@@ -670,22 +708,22 @@ fn compose(
                 {
                     continue;
                 }
-                match client.request(Request::SaveDraft(editing.clone())) {
+                let job = if send {
+                    BackgroundWrite::Send(editing.clone())
+                } else {
+                    BackgroundWrite::Draft(editing.clone())
+                };
+                match client.request(Request::Background(job)) {
+                    Ok(Reply::Committed | Reply::Ready) if send => return Ok(()),
+                    Ok(Reply::DraftCommitted(d)) => {
+                        editing = d.clone();
+                        saved = d;
+                        msg = "草稿已在本机提交".into();
+                    }
                     Ok(Reply::Saved(d, pending)) => {
-                        saved = d.clone();
-                        editing = d;
-                        if let Some(reason) = pending {
-                            msg = format!("已存于本机，等待同步. {reason}");
-                            continue;
-                        }
-                        msg = "草稿已存至云端".into();
-                        if send {
-                            match client.request(Request::Send(saved.reference.clone())) {
-                                Ok(Reply::Ready) => return Ok(()),
-                                Err(e) => msg = e.to_string(),
-                                _ => return Err(io::Error::other("Missing send acknowledgement")),
-                            }
-                        }
+                        editing = d.clone();
+                        saved = d;
+                        msg = pending.unwrap_or_else(|| "草稿已同步".into());
                     }
                     Ok(_) => return Err(io::Error::other("Missing draft acknowledgement")),
                     Err(e) => msg = e.to_string(),
@@ -1032,10 +1070,18 @@ pub(super) fn workspace(
                 execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                 t.clear()?;
                 response
+            } else if matches!(action, WorkAction::Save) {
+                client.request(Request::Background(BackgroundWrite::Workspace(
+                    space.clone(),
+                )))
             } else {
                 client.request(request)
             };
             match response {
+                Ok(Reply::Committed) => {
+                    status = "已在个人分支提交".into();
+                    break;
+                }
                 Ok(Reply::Work(WorkResult::Dirty)) => {
                     if matches!(
                         Form::new("工作区有未保存的修改", vec![], &["取消", "保存并提交"])
@@ -1279,7 +1325,26 @@ fn task_detail(
     let mut focus = 0usize;
     let mut message = String::new();
     let mut scroll = 0u16;
+    let mut awaiting_confirmation = false;
     loop {
+        if awaiting_confirmation
+            && let Reply::PublicationStatus(state) = client.request(Request::PublicationStatus)?
+            && state != PublicationState::Pushing
+            && let Reply::Published(current) = client.request(Request::Published)?
+            && let Some(updated) = current.into_iter().find(|l| l.id == letter.id)
+        {
+            for (i, item) in updated.checklist.iter().enumerate() {
+                if ticks[i] == letter.checklist[i].checked {
+                    ticks[i] = item.checked;
+                }
+            }
+            if staged == letter.completed {
+                staged = updated.completed;
+            }
+            letter = updated;
+            awaiting_confirmation = false;
+            message.clear();
+        }
         let mut bounds = Vec::new();
         let mut max_scroll = 0;
         t.draw(|f| {
@@ -1287,15 +1352,39 @@ fn task_detail(
             let inner = outer.inner(f.area());
             f.render_widget(outer, f.area());
             let show_progress = !letter.dependencies.is_empty() || !letter.checklist.is_empty();
-            let [addresses, progress, body, feedback, bar, footer] = Layout::vertical([
+            let [addresses, subtasks, progress, viewport, feedback, footer] = Layout::vertical([
                 Constraint::Length(3),
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(u16::from(!message.is_empty())),
                 Constraint::Length(1),
-                Constraint::Length(1),
             ])
             .areas(inner);
+            let body = Rect {
+                width: viewport.width.saturating_sub(1),
+                ..viewport
+            };
+            let titles = board
+                .iter()
+                .map(|l| (l.id.as_str(), l.title.as_str()))
+                .collect::<Vec<_>>();
+            let value = super::letter_editor::names(letter.dependencies.iter(), &titles);
+            f.render_widget(
+                Paragraph::new(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(
+                        "子任务  ",
+                        if focus == 1 {
+                            color.highlight()
+                        } else {
+                            Default::default()
+                        },
+                    ),
+                    ratatui::text::Span::raw(value),
+                ])),
+                subtasks,
+            );
+            bounds.push((1, subtasks));
             let names = super::letter_editor::names;
             let addresses_text = format!(
                 "发件人  {}\n收件人  {}\n抄送  {}",
@@ -1406,18 +1495,13 @@ fn task_detail(
                     .scroll((scroll, 0)),
                 body,
             );
-            let rect = super::action_cells(bar, 1)[0];
-            f.render_widget(
-                Paragraph::new("F1 子任务设置")
-                    .centered()
-                    .style(if focus == 1 {
-                        color.highlight()
-                    } else {
-                        Default::default()
-                    }),
-                rect,
+            super::scroll_gutter(
+                f,
+                viewport,
+                usize::from(scroll),
+                usize::from(max_scroll),
+                color,
             );
-            bounds.push((1, rect));
             f.render_widget(Paragraph::new(message.as_str()), feedback);
             f.render_widget(
                 Paragraph::new(if focus == 1 {
@@ -1430,10 +1514,6 @@ fn task_detail(
         })?;
         let submit = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                _ if super::shortcut(k, 1, false).is_some() => {
-                    focus = 1;
-                    true
-                }
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Char(' ') if focus >= 2 => {
                     ticks[focus - 2] = !ticks[focus - 2];
@@ -1453,23 +1533,25 @@ fn task_detail(
                     false
                 }
                 KeyCode::Enter => true,
-                KeyCode::Down if focus != 1 => {
+                KeyCode::Down if focus == 1 => {
+                    focus = 0;
+                    false
+                }
+                KeyCode::Up if focus == 0 && scroll == 0 => {
+                    focus = 1;
+                    false
+                }
+                KeyCode::Down => {
                     let next = if focus == 0 { 2 } else { focus + 1 };
                     if next < ticks.len() + 2 && bounds.iter().any(|(id, _)| *id == next) {
                         focus = next;
                     } else if scroll < max_scroll {
                         scroll += 1;
-                    } else {
-                        focus = 1;
                     }
                     false
                 }
-                KeyCode::Up if focus != 0 => {
-                    let prev = if focus == 1 {
-                        ticks.len() + 1
-                    } else {
-                        focus - 1
-                    };
+                KeyCode::Up if focus != 1 => {
+                    let prev = focus.saturating_sub(1);
                     if prev >= 2 && bounds.iter().any(|(id, _)| *id == prev) {
                         focus = prev;
                     } else if scroll > 0 {
@@ -1555,10 +1637,25 @@ fn task_detail(
                 observed: letter.dependencies.clone(),
             }
         };
-        match client.request(Request::Task {
+        match client.request(Request::Background(BackgroundWrite::Task {
             letter: letter.id.clone(),
-            change,
-        }) {
+            change: change.clone(),
+        })) {
+            Ok(Reply::Committed) => {
+                awaiting_confirmation = true;
+                match change {
+                    TaskChange::Completion(value) => letter.completed = value,
+                    TaskChange::Checklist(item) => {
+                        if let Some(entry) =
+                            letter.checklist.iter_mut().find(|e| e.line == item.line)
+                        {
+                            entry.checked = item.checked;
+                        }
+                    }
+                    TaskChange::Subtasks { selected, .. } => letter.dependencies = selected,
+                }
+                message = "已在本机提交".into();
+            }
             Ok(Reply::Ready) => {
                 message = "已同步".into();
                 if let Reply::Published(letters) = client.request(Request::Published)?

@@ -266,3 +266,53 @@ fn action_cells(area: ratatui::layout::Rect, count: usize) -> Vec<ratatui::layou
 }
 #[cfg(unix)]
 mod settings_tabs;
+
+#[cfg(unix)]
+fn scroll_gutter(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    offset: usize,
+    maximum: usize,
+    color: preferences::ThemeColor,
+) {
+    if maximum == 0 || area.is_empty() {
+        return;
+    }
+    let height = usize::from(area.height);
+    let thumb = (height * height / (height + maximum)).max(1);
+    let top = offset.min(maximum) * (height - thumb) / maximum;
+    let [r, g, b] = color.0;
+    for row in 0..height {
+        let active = (top..top + thumb).contains(&row);
+        frame.buffer_mut()[(area.right() - 1, area.y + row as u16)]
+            .set_symbol(if active { "┃" } else { "│" })
+            .set_fg(if active {
+                color.rgb()
+            } else {
+                ratatui::style::Color::Rgb(r / 2, g / 2, b / 2)
+            });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod scroll_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn thumb_reaches_both_ends_and_disappears_when_content_fits() {
+        let mut terminal = Terminal::new(TestBackend::new(8, 5)).unwrap();
+        let theme = preferences::ThemeColor([90, 120, 150]);
+        for (offset, max, top, bottom) in [(0, 12, "┃", "│"), (12, 12, "│", "┃"), (0, 0, " ", " ")]
+        {
+            terminal
+                .draw(|f| scroll_gutter(f, f.area(), offset, max, theme))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(7, 0)].symbol(), top);
+            assert_eq!(buffer[(7, 4)].symbol(), bottom);
+            if max > 0 {
+                assert_eq!(buffer[(7, if offset == 0 { 0 } else { 4 })].fg, theme.rgb());
+            }
+        }
+    }
+}

@@ -1,7 +1,7 @@
 //! Unix session ownership and JSON line transport.
 use super::{
     bootstrap,
-    protocol::{Entry, Reply, Request, VERSION},
+    protocol::{Entry, PublicationState, Reply, Request, VERSION},
 };
 use crate::adapters::local::state::ClientConfig;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -103,6 +103,7 @@ fn connection(
     generation: String,
     wake: mpsc::Sender<()>,
     sync_error: Arc<Mutex<Option<String>>>,
+    publication: Arc<Mutex<PublicationState>>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     let entry = match read(&mut reader)? {
@@ -115,86 +116,149 @@ fn connection(
         }
     };
     write(reader.get_mut(), &Reply::Ready)?;
-    loop {
-        let request = read(&mut reader)?;
-        let close = matches!(request, Request::Close);
-        let refresh_team = matches!(
-            request,
-            Request::Join(_)
-                | Request::Create { .. }
-                | Request::Register { .. }
-                | Request::Identities { .. }
-        );
-        let result = (|| -> io::Result<Reply> {
-            if matches!(request, Request::SyncStatus) {
-                return Ok(Reply::SyncStatus(
-                    sync_error
+    thread::scope(|scope| {
+        loop {
+            let request = read(&mut reader)?;
+            let close = matches!(request, Request::Close);
+            let refresh_team = matches!(
+                request,
+                Request::Join(_)
+                    | Request::Create { .. }
+                    | Request::Register { .. }
+                    | Request::Identities { .. }
+            );
+            let result = (|| -> io::Result<Reply> {
+                if matches!(request, Request::PublicationStatus) {
+                    let state = publication
                         .lock()
-                        .map_err(|_| io::Error::other("Sync status unavailable"))?
-                        .clone(),
-                ));
-            }
-            if let Some(reply) = super::host::cached_query(&file, &request, entry)? {
-                return Ok(reply);
-            }
-            match &request {
-                Request::ApplyTheme(rgb) => {
-                    ClientConfig::update(&file, |c| {
-                        c.theme_rgb = *rgb;
-                        c.fields.insert("custom_theme".into(), true.into());
-                    })?;
-                    return Ok(Reply::Color(*rgb));
+                        .map_err(|_| io::Error::other("Publication status unavailable"))?
+                        .clone();
+                    if matches!(state, PublicationState::Idle | PublicationState::Confirmed)
+                        && let Some(error) = sync_error
+                            .lock()
+                            .map_err(|_| io::Error::other("Sync status unavailable"))?
+                            .clone()
+                    {
+                        return Ok(Reply::PublicationStatus(PublicationState::Failed(error)));
+                    }
+                    return Ok(Reply::PublicationStatus(state));
                 }
-                Request::SetInterval(value) => {
-                    ClientConfig::update(&file, |c| c.sync_interval_seconds = *value)?;
-                    let _ = wake.send(());
-                    return Ok(Reply::Ready);
+                if let Request::Background(job) = request {
+                    let (tx, rx) = mpsc::channel();
+                    let lock = writer.clone();
+                    let file = file.clone();
+                    let status = publication.clone();
+                    let wake = wake.clone();
+                    scope.spawn(move || {
+                        let result = (|| {
+                            let _guard = lock
+                                .lock()
+                                .map_err(|_| io::Error::other("Writer unavailable"))?;
+                            let mut receipt = Some(tx.clone());
+                            let result = super::host::perform_observed(
+                                &file,
+                                job.request(),
+                                entry,
+                                &mut |reply| {
+                                    if let Some(channel) = receipt.take() {
+                                        if let Ok(mut state) = status.lock() {
+                                            *state = PublicationState::Pushing;
+                                        }
+                                        let _ = channel.send(Ok(reply));
+                                    }
+                                },
+                            );
+                            if let Ok(mut state) = status.lock() {
+                                *state = match &result {
+                                    Err(e) => PublicationState::Failed(e.to_string()),
+                                    Ok(Reply::Saved(_, Some(e))) => {
+                                        PublicationState::Failed(e.clone())
+                                    }
+                                    Ok(_) => PublicationState::Confirmed,
+                                };
+                            }
+                            result
+                        })();
+                        let _ = tx.send(result);
+                        let _ = wake.send(());
+                    });
+                    return rx
+                        .recv()
+                        .map_err(|_| io::Error::other("Publication worker stopped"))?;
                 }
-                Request::Close => return Ok(Reply::Ready),
-                _ => {}
+                if matches!(request, Request::SyncStatus) {
+                    return Ok(Reply::SyncStatus(
+                        sync_error
+                            .lock()
+                            .map_err(|_| io::Error::other("Sync status unavailable"))?
+                            .clone(),
+                    ));
+                }
+                if let Some(reply) = super::host::cached_query(&file, &request, entry)? {
+                    return Ok(reply);
+                }
+                match &request {
+                    Request::ApplyTheme(rgb) => {
+                        ClientConfig::update(&file, |c| {
+                            c.theme_rgb = *rgb;
+                            c.fields.insert("custom_theme".into(), true.into());
+                        })?;
+                        return Ok(Reply::Color(*rgb));
+                    }
+                    Request::SetInterval(value) => {
+                        ClientConfig::update(&file, |c| c.sync_interval_seconds = *value)?;
+                        let _ = wake.send(());
+                        return Ok(Reply::Ready);
+                    }
+                    Request::Close => return Ok(Reply::Ready),
+                    _ => {}
+                }
+                let _guard = writer
+                    .lock()
+                    .map_err(|_| io::Error::other("Settings lock unavailable"))?;
+                match request {
+                    Request::ApplyTheme(_) | Request::SetInterval(_) => unreachable!(),
+                    Request::SyncStatus | Request::Background(_) | Request::PublicationStatus => {
+                        unreachable!()
+                    }
+                    Request::Interval => Ok(Reply::Interval(
+                        ClientConfig::read(&file)?.sync_interval_seconds,
+                    )),
+                    Request::Theme => Ok(Reply::Color(ClientConfig::read(&file)?.theme_rgb)),
+                    Request::Close => Ok(Reply::Ready),
+                    other @ (Request::Profile
+                    | Request::Register { .. }
+                    | Request::SetupPending
+                    | Request::Join(_)
+                    | Request::Create { .. }
+                    | Request::Identities { .. }
+                    | Request::Send(_)
+                    | Request::SendCurrent(_)
+                    | Request::Task { .. }
+                    | Request::Read(_)
+                    | Request::Published
+                    | Request::Board
+                    | Request::OpenDraft(_)
+                    | Request::Drafts
+                    | Request::SaveDraft(_)
+                    | Request::Tags
+                    | Request::ToggleTag(_)
+                    | Request::SpaceSync { .. }
+                    | Request::WorkspaceAction { .. }
+                    | Request::Workspace) => super::host::perform_as(&file, other, entry),
+                    Request::Hello(..) => Err(io::Error::other("Session already connected")),
+                }
+            })();
+            if refresh_team && result.is_ok() {
+                let _ = wake.send(());
             }
-            let _guard = writer
-                .lock()
-                .map_err(|_| io::Error::other("Settings lock unavailable"))?;
-            match request {
-                Request::ApplyTheme(_) | Request::SetInterval(_) => unreachable!(),
-                Request::SyncStatus => unreachable!(),
-                Request::Interval => Ok(Reply::Interval(
-                    ClientConfig::read(&file)?.sync_interval_seconds,
-                )),
-                Request::Theme => Ok(Reply::Color(ClientConfig::read(&file)?.theme_rgb)),
-                Request::Close => Ok(Reply::Ready),
-                other @ (Request::Profile
-                | Request::Register { .. }
-                | Request::SetupPending
-                | Request::Join(_)
-                | Request::Create { .. }
-                | Request::Identities { .. }
-                | Request::Send(_)
-                | Request::Task { .. }
-                | Request::Read(_)
-                | Request::Published
-                | Request::Board
-                | Request::OpenDraft(_)
-                | Request::Drafts
-                | Request::SaveDraft(_)
-                | Request::Tags
-                | Request::ToggleTag(_)
-                | Request::SpaceSync { .. }
-                | Request::WorkspaceAction { .. }
-                | Request::Workspace) => super::host::perform_as(&file, other, entry),
-                Request::Hello(..) => Err(io::Error::other("Session already connected")),
+            let reply = result.unwrap_or_else(|e| Reply::Failure(e.to_string()));
+            write(reader.get_mut(), &reply)?;
+            if close {
+                return Ok(());
             }
-        })();
-        if refresh_team && result.is_ok() {
-            let _ = wake.send(());
         }
-        let reply = result.unwrap_or_else(|e| Reply::Failure(e.to_string()));
-        write(reader.get_mut(), &reply)?;
-        if close {
-            return Ok(());
-        }
-    }
+    })
 }
 
 pub fn host(file: PathBuf) -> io::Result<()> {
@@ -258,12 +322,20 @@ pub fn host(file: PathBuf) -> io::Result<()> {
     let worker_lock = writer.clone();
     let sync_error = Arc::new(Mutex::new(None));
     let worker_error = sync_error.clone();
+    let publication = Arc::new(Mutex::new(PublicationState::Idle));
+    let recovery_status = publication.clone();
     let sync_worker = thread::spawn(move || {
         loop {
             if let Ok(_guard) = worker_lock.lock() {
                 let error = super::host::synchronize(&worker_file)
                     .err()
                     .map(|e| e.to_string());
+                if error.is_none()
+                    && let Ok(mut state) = recovery_status.lock()
+                    && matches!(*state, PublicationState::Failed(_))
+                {
+                    *state = PublicationState::Idle;
+                }
                 if let Ok(mut last) = worker_error.lock() {
                     *last = error;
                 }
@@ -292,8 +364,9 @@ pub fn host(file: PathBuf) -> io::Result<()> {
                 let wake = stop.clone();
                 let error = sync_error.clone();
                 let generation = generation.clone();
+                let publication = publication.clone();
                 workers.push(thread::spawn(move || {
-                    let _ = connection(stream, file, writer, generation, wake, error);
+                    let _ = connection(stream, file, writer, generation, wake, error, publication);
                     let _ = done.send(());
                 }));
             }
@@ -361,6 +434,7 @@ mod navigation_tests {
                 "fixture".into(),
                 wake,
                 Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(PublicationState::Idle)),
             )
         });
         fs::create_dir_all(roots.work.join("local-notes"))?;

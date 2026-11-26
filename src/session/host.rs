@@ -20,6 +20,14 @@ fn perform(file: &Path, request: Request) -> io::Result<Reply> {
     perform_as(file, request, Entry::Human)
 }
 pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Result<Reply> {
+    perform_observed(file, request, entry, &mut |_| {})
+}
+pub(super) fn perform_observed(
+    file: &Path,
+    request: Request,
+    entry: Entry,
+    ready: &mut dyn FnMut(Reply),
+) -> io::Result<Reply> {
     let mut config = ClientConfig::read(file)?;
     let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
     let mut current = profile(&config)?;
@@ -64,7 +72,15 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                 &dir.join("intent.json"),
                 &(&p.remote, &letter, &change, &intent),
             )?;
-            operations::change_task(&roots.state, &p.team, &p.remote, &letter, &intent, &change)?;
+            operations::change_task_observed(
+                &roots.state,
+                &p.team,
+                &p.remote,
+                &letter,
+                &intent,
+                &change,
+                &mut || ready(Reply::Committed),
+            )?;
             fs::remove_file(dir.join("intent.json"))?;
             fs::remove_dir(dir)?;
             Ok(Reply::Ready)
@@ -297,7 +313,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             }
             save_profile(config, file, team)
         }
-        Request::Drafts | Request::SaveDraft(_) | Request::Send(_) => {
+        Request::Drafts | Request::SaveDraft(_) | Request::Send(_) | Request::SendCurrent(_) => {
             let team = current.ok_or_else(|| io::Error::other("Team required"))?;
             if entry.actor(&team).is_empty() {
                 return if matches!(request, Request::Drafts) {
@@ -323,6 +339,13 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     _ => {}
                 }
             }
+            let request = if let Request::SendCurrent(mut draft) = request {
+                let copy = editing_copy(&base, &mut draft)?;
+                write_local(&copy.join("editing.json"), &draft)?;
+                Request::Send(draft.reference)
+            } else {
+                request
+            };
             if let Request::Send(reference) = request {
                 if !reference
                     .strip_prefix("letter-local-")
@@ -359,7 +382,13 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     fs::File::open(&tmp)?.sync_all()?;
                     fs::rename(tmp, &dest)?;
                 }
-                operations::send_letter(&roots.state, &team.team, &team.remote, &intent)?;
+                operations::send_letter_observed(
+                    &roots.state,
+                    &team.team,
+                    &team.remote,
+                    &intent,
+                    &mut || ready(Reply::Committed),
+                )?;
                 fs::write(copy.join("sent"), &intent.key)?;
                 fs::remove_file(out.join("intent.json"))?;
                 fs::remove_dir(out)?;
@@ -376,12 +405,23 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                 };
                 write_local(&copy.join("save-pending.json"), &intent)?;
                 write_local(&copy.join("editing.json"), &intent.draft)?;
-                return match finish_cloud_save(&roots.state, &team, &copy, &intent) {
+                return match finish_cloud_save_observed(
+                    &roots.state,
+                    &team,
+                    &copy,
+                    &intent,
+                    &mut |location| {
+                        let mut draft = intent.draft.clone();
+                        draft.cloud = Some(location);
+                        ready(Reply::DraftCommitted(draft));
+                    },
+                ) {
                     Ok(d) => Ok(Reply::Saved(d, None)),
                     Err(e) => Ok(Reply::Saved(intent.draft, Some(e.to_string()))),
                 };
             }
             let mut local = Vec::new();
+            let mut save_error = None;
             for entry in fs::read_dir(&base)? {
                 let entry = entry?;
                 if !entry.file_type()?.is_dir() {
@@ -395,7 +435,11 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                     read_optional::<operations::FrozenSend>(&copy.join("save-pending.json"))?
                 {
                     let result = finish_cloud_save(&roots.state, &team, &copy, &intent);
-                    local.push((result.unwrap_or(intent.draft), copy));
+                    let draft = result.unwrap_or_else(|e| {
+                        save_error = Some(e);
+                        intent.draft
+                    });
+                    local.push((draft, copy));
                 } else if let Some(draft) = read_optional::<Draft>(&copy.join("editing.json"))? {
                     local.push((draft, copy))
                 }
@@ -435,6 +479,9 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
             }
             let drafts: Vec<_> = local.into_iter().map(|(d, _)| d).collect();
             write_local(&base.join("current-list.json"), &drafts)?;
+            if let Some(error) = save_error {
+                return Err(error);
+            }
             Ok(Reply::Drafts(drafts))
         }
         Request::Tags | Request::ToggleTag(_) => {
@@ -469,7 +516,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
         }
         Request::WorkspaceAction { space, action } => {
             let profile = current.ok_or_else(|| io::Error::other("Team required"))?;
-            let result = operations::workspace_action(
+            let result = operations::workspace_action_observed(
                 &roots.state,
                 &roots.work,
                 &profile.team,
@@ -477,6 +524,7 @@ pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Res
                 &profile.human,
                 &space,
                 action,
+                &mut || ready(Reply::Committed),
             )?;
             let sync = crate::adapters::git::workspace_sync::Space::open(
                 &roots.state,
@@ -861,7 +909,11 @@ pub(super) fn synchronize(file: &Path) -> io::Result<()> {
     }
     perform_as(file, Request::Published, Entry::Human)?;
     let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
-    let mut result = retry_outbox(&roots.state, &p);
+    let mut result = retry_outbox(&roots.state, &p).and(operations::retry_personal(
+        &roots.state,
+        &p.team,
+        &p.remote,
+    ));
     for (actor, _) in p.team.roster() {
         if actor == p.human || actor == p.assistant {
             continue;
@@ -1035,8 +1087,28 @@ fn finish_cloud_save(
     copy: &Path,
     intent: &operations::FrozenSend,
 ) -> io::Result<Draft> {
-    let location =
-        crate::adapters::git::drafts::save(root, &profile.team, &profile.remote, intent)?;
+    finish_cloud_save_observed(root, profile, copy, intent, &mut |_| {})
+}
+fn finish_cloud_save_observed(
+    root: &Path,
+    profile: &Profile,
+    copy: &Path,
+    intent: &operations::FrozenSend,
+    ready: &mut dyn FnMut(crate::application::letters::CloudDraft),
+) -> io::Result<Draft> {
+    let location = crate::adapters::git::drafts::save_observed(
+        root,
+        &profile.team,
+        &profile.remote,
+        intent,
+        &mut |location| {
+            let mut local = intent.draft.clone();
+            local.cloud = Some(location.clone());
+            write_local(&copy.join("editing.json"), &local)?;
+            ready(location);
+            Ok(())
+        },
+    )?;
     let mut draft = intent.draft.clone();
     draft.cloud = Some(location);
     write_local(&copy.join("editing.json"), &draft)?;

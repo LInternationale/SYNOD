@@ -474,6 +474,16 @@ pub(super) fn originals(s: &FrozenSend) -> io::Result<std::collections::BTreeMap
 
 /// Publish the frozen draft using only ordinary fast-forward ref updates.
 pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) -> io::Result<()> {
+    send_letter_observed(root, team, remote, s, &mut || {})
+}
+
+pub(crate) fn send_letter_observed(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    s: &FrozenSend,
+    ready: &mut dyn FnMut(),
+) -> io::Result<()> {
     use std::fs;
     team.validate()?;
     if team.id() != s.team
@@ -495,18 +505,7 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     }
     let event = format!("evt-{}", s.key);
     let prefix = format!("letters/{letter}");
-    let copy = s
-        .draft
-        .cloud
-        .as_ref()
-        .map_or("primary", |c| c.copy.as_str());
-    let branch = format!("refs/heads/drafts/{}/{letter}/{copy}", s.actor);
     let files = originals(s)?;
-    let draft_msg = commit_message(
-        "draft.saved",
-        s,
-        &format!("letter_id = \"{letter}\"\ncopy_id = \"{copy}\""),
-    )?;
     let sent_msg = commit_message(
         "letter.sent",
         s,
@@ -573,36 +572,21 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
             continue;
         }
         git(&dir, &["switch", "--detach", base])?;
-        let draft_oid = if git(&dir, &["ls-remote", "--", remote, &branch])?.is_empty() {
-            for (path, bytes) in &files {
-                let dest = dir.join(&prefix).join(path);
-                fs::create_dir_all(
-                    dest.parent()
-                        .ok_or_else(|| io::Error::other("Missing parent"))?,
-                )?;
-                fs::write(dest, bytes)?
-            }
-            git(&dir, &["add", "--", &prefix])?;
-            commit(&dir, &draft_msg)?;
-            git(&dir, &["push", "--", remote, &format!("HEAD:{branch}")])?;
-            git(&dir, &["rev-parse", "HEAD"])?
-        } else {
-            git(&dir, &["fetch", "--no-tags", "--", remote, &branch])?;
-            let observed = s
-                .draft
-                .cloud
-                .as_ref()
-                .map_or("FETCH_HEAD", |c| c.revision.as_str());
-            for (path, bytes) in &files {
-                if git(&dir, &["show", &format!("{observed}:{prefix}/{path}")])? != *bytes {
-                    return Err(io::Error::other("Cloud draft differs from frozen send"));
-                }
-            }
-            git(&dir, &["rev-parse", observed])?
-        };
-        let draft_oid = std::str::from_utf8(&draft_oid)
-            .map_err(io::Error::other)?
-            .trim();
+        let (source, draft) = super::drafts::prepare_for_send(root, team, remote, s)?;
+        let draft_oid = draft.revision.as_str();
+        git(
+            &dir,
+            &[
+                "fetch",
+                "--no-tags",
+                "--",
+                source
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("Invalid draft repository path"))?,
+                draft_oid,
+            ],
+        )?;
+        let branch = format!("refs/heads/drafts/{}/{letter}/{}", s.actor, draft.copy);
         git(&dir, &["switch", "--detach", base])?;
         git(&dir, &["merge", "--no-ff", "--no-commit", draft_oid])?;
         let changes = git(&dir, &["diff", "--cached", "--name-only", "-z", base])?;
@@ -620,6 +604,11 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
         if parents != format!("{base} {draft_oid}\n").as_bytes() {
             return Err(io::Error::other("Invalid publication parents"));
         }
+        ready();
+        git(
+            &dir,
+            &["push", "--", remote, &format!("{draft_oid}:{branch}")],
+        )?;
         match git(&dir, &["push", "--", remote, "HEAD:refs/heads/main"]) {
             Ok(_) => {
                 let confirmed = published_letters(root, team, remote)?;
@@ -709,6 +698,46 @@ fn check_staged_scope(dir: &Path, space: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn push_personal(cache: &Path, remote: &str, pending: &str) -> io::Result<()> {
+    let name = pending
+        .strip_prefix("refs/synod/push/")
+        .ok_or_else(|| io::Error::other("Invalid pending branch"))?;
+    let oid = String::from_utf8(git(cache, &["rev-parse", "--verify", pending])?)
+        .map_err(io::Error::other)?;
+    let oid = oid.trim();
+    git(
+        cache,
+        &[
+            "push",
+            "--",
+            remote,
+            &format!("{oid}:refs/heads/work/{name}"),
+        ],
+    )?;
+    git(
+        cache,
+        &["update-ref", &format!("refs/synod/personal/{name}"), oid],
+    )?;
+    git(cache, &["update-ref", "-d", pending, oid])?;
+    Ok(())
+}
+
+pub(crate) fn retry_personal(state: &Path, team: &NewTeam, remote: &str) -> io::Result<()> {
+    let cache = state.join("teams").join(team.id()).join("repo.git");
+    if !cache.is_dir() {
+        return Ok(());
+    }
+    let refs = String::from_utf8(git(
+        &cache,
+        &["for-each-ref", "--format=%(refname)", "refs/synod/push/"],
+    )?)
+    .map_err(io::Error::other)?;
+    for reference in refs.lines() {
+        push_personal(&cache, remote, reference)?;
+    }
+    Ok(())
+}
+
 pub fn workspace_action(
     state: &Path,
     work: &Path,
@@ -717,6 +746,19 @@ pub fn workspace_action(
     actor: &str,
     space: &str,
     action: crate::session::protocol::WorkAction,
+) -> io::Result<crate::session::protocol::WorkResult> {
+    workspace_action_observed(state, work, team, remote, actor, space, action, &mut || {})
+}
+
+pub(crate) fn workspace_action_observed(
+    state: &Path,
+    work: &Path,
+    team: &NewTeam,
+    remote: &str,
+    actor: &str,
+    space: &str,
+    action: crate::session::protocol::WorkAction,
+    ready: &mut dyn FnMut(),
 ) -> io::Result<crate::session::protocol::WorkResult> {
     use crate::session::protocol::{WorkAction as A, WorkResult as R};
     use std::fs;
@@ -832,6 +874,11 @@ pub fn workspace_action(
     if manifest.id() != team.id() {
         return Err(io::Error::other("Remote team does not match this client"));
     }
+    let cache = base.join("repo.git");
+    let pending = format!("refs/synod/push/{actor}/{key}");
+    if cache.is_dir() && git(&cache, &["rev-parse", "--verify", &pending]).is_ok() {
+        push_personal(&cache, remote, &pending)?;
+    }
     let has_personal = !git(&dir, &["ls-remote", "--", remote, &personal])?.is_empty();
     if has_personal {
         git(
@@ -886,9 +933,6 @@ pub fn workspace_action(
     }
     if dirty {
         commit(&dir, &work_msg("workspace.saved", team.id(), actor, space)?)?;
-        git(&dir, &["push", "--", remote, &format!("HEAD:{personal}")])?;
-    } else if !has_personal && matches!(action, A::Save | A::SaveAndSubmit) {
-        git(&dir, &["push", "--", remote, &format!("HEAD:{personal}")])?;
     }
     if dirty || !has_personal {
         let cache = base.join("repo.git");
@@ -897,6 +941,7 @@ pub fn workspace_action(
         let path = dir
             .to_str()
             .ok_or_else(|| io::Error::other("Invalid local candidate path"))?;
+        let pending = format!("refs/synod/push/{actor}/{key}");
         git(
             &cache,
             &[
@@ -905,9 +950,14 @@ pub fn workspace_action(
                 "--no-tags",
                 "--",
                 path,
-                &format!("+HEAD:refs/synod/personal/{actor}/{key}"),
+                &format!("HEAD:{pending}"),
             ],
         )?;
+        if matches!(action, A::Save) {
+            super::workspace_sync::Space::open(state, work, team, space)?.mark_saved()?;
+            ready();
+        }
+        push_personal(&cache, remote, &pending)?;
     }
     if matches!(action, A::Save) {
         return Ok(R::Saved);
@@ -999,6 +1049,18 @@ pub fn change_task(
     target: &str,
     intent: &InitialCommit,
     change: &crate::application::letters::TaskChange,
+) -> io::Result<()> {
+    change_task_observed(root, team, remote, target, intent, change, &mut || {})
+}
+
+pub(crate) fn change_task_observed(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    target: &str,
+    intent: &InitialCommit,
+    change: &crate::application::letters::TaskChange,
+    ready: &mut dyn FnMut(),
 ) -> io::Result<()> {
     use crate::application::letters::{LetterEvent, TaskChange};
     use std::fs;
@@ -1136,6 +1198,7 @@ pub fn change_task(
         if !git(&dir, &["diff", "--name-only", "HEAD^", "HEAD"])?.is_empty() {
             return Err(io::Error::other("Unexpected task event paths"));
         }
+        ready();
         if git(&dir, &["push", "--", remote, "HEAD:refs/heads/main"]).is_ok() {
             let confirmed = published_letters(root, team, remote)?;
             if confirmed

@@ -1,10 +1,12 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 6;
+pub const VERSION: u8 = 7;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Hello(u8, String, Entry),
     SyncStatus,
+    PublicationStatus,
+    Background(BackgroundWrite),
     Interval,
     SetInterval(std::num::NonZeroU32),
     SpaceSync {
@@ -32,6 +34,7 @@ pub enum Request {
         assistant: String,
     },
     Send(String),
+    SendCurrent(Draft),
     Task {
         letter: String,
         change: crate::application::letters::TaskChange,
@@ -54,6 +57,9 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
     SyncStatus(Option<String>),
+    PublicationStatus(PublicationState),
+    Committed,
+    DraftCommitted(Draft),
     Interval(std::num::NonZeroU32),
     SpaceSync(crate::adapters::git::workspace_sync::Preview),
     Letter(PublishedLetter),
@@ -146,4 +152,36 @@ pub struct LetterRow {
     pub to: String,
     pub cc: Vec<String>,
     pub unread: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum BackgroundWrite {
+    Draft(Draft),
+    Send(Draft),
+    Task {
+        letter: String,
+        change: crate::application::letters::TaskChange,
+    },
+    Workspace(String),
+}
+impl BackgroundWrite {
+    pub(crate) fn request(self) -> Request {
+        match self {
+            Self::Draft(d) => Request::SaveDraft(d),
+            Self::Send(draft) => Request::SendCurrent(draft),
+            Self::Task { letter, change } => Request::Task { letter, change },
+            Self::Workspace(space) => Request::WorkspaceAction {
+                space,
+                action: WorkAction::Save,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PublicationState {
+    Idle,
+    Pushing,
+    Confirmed,
+    Failed(String),
 }
