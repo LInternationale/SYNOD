@@ -1,0 +1,11 @@
+{
+  "letter_id": "letter-042",
+  "from": "member-chen",
+  "to": "member-alice",
+  "cc": ["member-bob"],
+  "title": "重画图 3",
+  "initial_dependencies": ["letter-041"],
+  "attachments": [
+    {"attachment_id": "asset-001", "filename": "绘图说明.txt"}
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "event_id": "evt-018",
+  "letter_id": "letter-042",
+  "actor_id": "member-alice",
+  "occurred_at": "2026-11-26T15:42:00+08:00",
+  "kind": "MarkedCompleted"
+}

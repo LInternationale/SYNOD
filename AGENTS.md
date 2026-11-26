@@ -6,6 +6,8 @@ This file provides project engineering instructions for Codex when working in th
 
 Apply these instructions to work in this project, together with applicable instructions from parent directories and more specific instructions loaded for the working directory.
 
+Follow the reviewed [file layout](docs/file-layout.md), [team Git commit format](docs/git-commit-format.md), and [shared client session](docs/client-session.md) when implementing the [initial design](docs/initial-design.md).
+
 ## CRITICAL: Highest Priority Within This File & Circuit Breaker
 
 The mandatory engineering standards and workflow in this file have the **HIGHEST PRIORITY within AGENTS.md**. The architecture recommendations below are advisory and do not have the same mandatory status.

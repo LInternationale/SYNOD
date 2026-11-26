@@ -1,0 +1,156 @@
+fixture_version = 1
+
+[[step]]
+branch = "main"
+write = ["team.json"]
+message = '''
+kind = "team.configured"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-001"
+actor_id = "member-chen"
+occurred_at = 2026-11-26T13:00:00+08:00
+'''
+
+[[step]]
+branch = "drafts/member-alice/letter-041/primary"
+write = ["letters/letter-041/envelope.json", "letters/letter-041/body.md"]
+message = '''
+kind = "draft.saved"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-002"
+actor_id = "member-alice"
+occurred_at = 2026-11-26T13:48:00+08:00
+
+[target]
+letter_id = "letter-041"
+copy_id = "primary"
+'''
+
+[[step]]
+branch = "main"
+merge_from = "drafts/member-alice/letter-041/primary"
+write = ["letters/letter-041/events/evt-015.json"]
+message = '''
+kind = "letter.sent"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-003"
+actor_id = "member-alice"
+occurred_at = 2026-11-26T13:50:00+08:00
+
+[target]
+letter_id = "letter-041"
+event_id = "evt-015"
+'''
+
+[[step]]
+branch = "drafts/member-chen/letter-042/primary"
+write = [
+  "letters/letter-042/envelope.json",
+  "letters/letter-042/body.md",
+  "letters/letter-042/attachments/asset-001",
+]
+message = '''
+kind = "draft.saved"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-004"
+actor_id = "member-chen"
+occurred_at = 2026-11-26T14:04:00+08:00
+
+[target]
+letter_id = "letter-042"
+copy_id = "primary"
+'''
+
+[[step]]
+branch = "main"
+merge_from = "drafts/member-chen/letter-042/primary"
+write = ["letters/letter-042/events/evt-017.json"]
+message = '''
+kind = "letter.sent"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-005"
+actor_id = "member-chen"
+occurred_at = 2026-11-26T14:05:00+08:00
+
+[target]
+letter_id = "letter-042"
+event_id = "evt-017"
+'''
+
+[[step]]
+branch = "main"
+write = ["workspace/code/results-v2.csv"]
+message = '''
+kind = "workspace.published"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-006"
+actor_id = "assistant-chen"
+occurred_at = 2026-11-26T14:19:00+08:00
+
+[target]
+space_id = "code"
+'''
+
+[[step]]
+branch = "main"
+write = ["letters/letter-041/events/evt-016.json"]
+message = '''
+kind = "letter.event"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-007"
+actor_id = "member-chen"
+occurred_at = 2026-11-26T14:20:00+08:00
+
+[target]
+letter_id = "letter-041"
+event_id = "evt-016"
+event_kind = "MarkedCompleted"
+'''
+
+[[step]]
+branch = "main"
+write = ["letters/letter-042/events/evt-018.json"]
+message = '''
+kind = "letter.event"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-008"
+actor_id = "member-alice"
+occurred_at = 2026-11-26T15:42:00+08:00
+
+[target]
+letter_id = "letter-042"
+event_id = "evt-018"
+event_kind = "MarkedCompleted"
+'''
+
+[[step]]
+branch = "main"
+write = ["workspace/paper/figure-3.tex"]
+message = '''
+kind = "workspace.published"
+
+schema_version = 1
+team_id = "team-aurora"
+operation_id = "op-009"
+actor_id = "member-bob"
+occurred_at = 2026-11-26T16:00:00+08:00
+
+[target]
+space_id = "paper"
+'''

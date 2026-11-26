@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "team_id": "team-aurora",
+  "members": [
+    {"actor_id": "member-chen", "kind": "human", "display_name": "Chen"},
+    {"actor_id": "member-alice", "kind": "human", "display_name": "Alice"},
+    {"actor_id": "member-bob", "kind": "human", "display_name": "Bob"},
+    {"actor_id": "assistant-chen", "kind": "assistant", "display_name": "Chen's AI"},
+    {"actor_id": "assistant-alice", "kind": "assistant", "display_name": "Alice's AI"},
+    {"actor_id": "assistant-bob", "kind": "assistant", "display_name": "Bob's AI"}
+  ],
+  "spaces": [
+    {"space_id": "code", "display_name": "Code"},
+    {"space_id": "paper", "display_name": "Paper"}
+  ]
+}
