@@ -23,3 +23,15 @@ TitleKey in src/mail/letter.rs borrows the trimmed title. Internal tests exercis
 The TUI receives a published list from the session. It tracks the selected letter by identifier and holds either board or detail state. Enter and Escape change screens, arrows move within the supplied list. The caller owns ordering. The view never reads Git. Render the selected screen through Ratatui. Independent review identified that retaining a row number would open the wrong letter after a refresh. Resolve by using stable identifiers and exercise reordered input, empty lists, edge movement and detail rendering with the test backend.
 
 BoardScreen implements the reviewed key transitions and resolves a selection by ID after reordering. The Ratatui backend test renders both screens and exercises empty and boundary cases. Navigation has 8/8 measured branches covered. The live session, setup, preferences and composer still need integration.
+
+## Confirmed application flow
+
+First run offers create-team and join-team paths. Either identity may be skipped. Preferences can change setup later. The board opens compose, preferences and workspace. Escape returns from each to the board. Compose edits in place and saves a draft. Sending acts on a draft. Workspace previews directory structure and handles updates, publishing and per-space mode selection. The operating system file manager handles browsing files. Draft discovery, unsaved changes, button activation and remote creation are pending interaction decisions.
+
+## Team history message reader
+
+Implement the v1 wire contract in the Git adapter before connecting it to a process. Deserialize the common metadata and dispatch the target table into one of five typed variants. Require an offset datetime and LF-terminated input. This reader consumes team history, never software development commits. The operations layer will later verify identifiers against paths and events before accepting history.
+
+Independent review: target shape must depend on kind even when common metadata is valid. An absent target is legal only for team configuration. Test every fixture message and reject malformed metadata, target mismatches and unsupported versions. Scope here is decoding. Encoding and actual Git object verification remain outstanding.
+
+Implementation comparison: commit_message::decode reads the complete message and maps each target to its operation variant. The fixture integration test covers all five variants, missing and surplus target data, invalid metadata, line endings, timestamp offsets and unsupported versions. Seven workspace tests including documentation passed. The reader covered 8/8 measured branches. Actual history replay is still pending.

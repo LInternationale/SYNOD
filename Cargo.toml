@@ -7,3 +7,5 @@ publish = false
 [dependencies]
 ratatui = { version = "0.30", default-features = false }
 crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
