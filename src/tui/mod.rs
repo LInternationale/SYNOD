@@ -71,6 +71,15 @@ impl BoardScreen {
 
     /// Draw the current screen into a Ratatui frame.
     pub fn render(&mut self, frame: &mut Frame<'_>, letters: &[LetterView<'_>]) {
+        self.render_area(frame, frame.area(), letters);
+    }
+
+    fn render_area(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        letters: &[LetterView<'_>],
+    ) {
         self.refresh(letters);
         let selection = self.position(letters);
         if let (Self::Detail(_), Some(index)) = (&self, selection) {
@@ -79,7 +88,7 @@ impl BoardScreen {
                 Paragraph::new(letter.body)
                     .wrap(Wrap { trim: false })
                     .block(Block::bordered().title(letter.title)),
-                frame.area(),
+                area,
             );
             return;
         }
@@ -94,8 +103,11 @@ impl BoardScreen {
         let mut state = ratatui::widgets::ListState::default().with_selected(selection);
         frame.render_stateful_widget(
             List::new(items).block(Block::bordered().title("公告板")),
-            frame.area(),
+            area,
             &mut state,
         );
     }
 }
+
+pub mod bulletin;
+pub mod preferences;

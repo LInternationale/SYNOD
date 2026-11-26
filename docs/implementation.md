@@ -35,3 +35,17 @@ Implement the v1 wire contract in the Git adapter before connecting it to a proc
 Independent review: target shape must depend on kind even when common metadata is valid. An absent target is legal only for team configuration. Test every fixture message and reject malformed metadata, target mismatches and unsupported versions. Scope here is decoding. Encoding and actual Git object verification remain outstanding.
 
 Implementation comparison: commit_message::decode reads the complete message and maps each target to its operation variant. The fixture integration test covers all five variants, missing and surplus target data, invalid metadata, line endings, timestamp offsets and unsupported versions. Seven workspace tests including documentation passed. The reader covered 8/8 measured branches. Actual history replay is still pending.
+
+## Draft rows and board actions
+
+The board presents the active identity's draft copies first, then published letters, preserving session order inside each group. Prefix every draft title with 草稿. Distinguish draft copies by their complete draft reference and published records by letter ID. The runtime owns source data. The board component forwards selected drafts and the three board buttons as typed actions. Tab traverses the list and buttons. Enter and a primary-button click use the same button action. Derive hit regions from the render layout. Saving stays in compose; Escape on dirty input asks 是否丢弃更改. Repository creation follows confirmation of account, repository name and visibility. Preferences includes 设置主题色; its input and persistence interaction await confirmation.
+
+Independent review: a draft and a publication can share a letter ID, and concurrent draft copies can share a title. Use separate UI keys and accept the complete copy reference. Keep drafts out of published title indexes. Verify draft ordering, button interaction equivalence and empty boards via the public component.
+
+## Theme preference transaction
+
+Only custom RGB is supported. Preferences edits three channels independently of the active theme. Apply Settings validates all three before requesting local persistence and only publishes the new color on success. Inject the initial active color from settings. The default RGB and which widgets it colors remain user decisions. Independent review: a failed save must preserve both the previous active color and the user's edits. Exercise invalid, failed and successful applications.
+
+Bulletin verification: the public Ratatui test rendered the draft before the published letter, checked its label, activated all three buttons through both inputs, and opened the intended draft reference. Eight tests passed; bulletin branch coverage was 22/24.
+
+ThemeEditor takes the current color explicitly. Its apply operation preserves edits on invalid input or storage failure. Ten tests passed including the public apply example. Overall measured branch coverage is 38/40. The preference form, local storage adapter and live terminal integration remain outstanding.
