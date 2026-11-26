@@ -120,3 +120,5 @@ pub mod preferences;
 
 #[cfg(unix)]
 pub mod live;
+#[cfg(unix)]
+mod native_file;

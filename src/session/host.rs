@@ -20,6 +20,17 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
     let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
     let current = profile(&config)?;
     match request {
+        Request::Published => {
+            let team = current.ok_or_else(|| io::Error::other("Team required"))?;
+            if config.pending_team.is_some() {
+                return Ok(Reply::Published(Vec::new()));
+            }
+            Ok(Reply::Published(operations::published_letters(
+                &roots.state,
+                &team.team,
+                &team.remote,
+            )?))
+        }
         Request::Profile => Ok(Reply::Team(current)),
         Request::Create {
             owner,
@@ -125,7 +136,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
             }
             save_profile(config, file, team)
         }
-        Request::Drafts | Request::SaveDraft(_) => {
+        Request::Drafts | Request::SaveDraft(_) | Request::Send(_) => {
             let team = current.ok_or_else(|| io::Error::other("Team required"))?;
             if team.human.is_empty() {
                 return if matches!(request, Request::Drafts) {
@@ -143,8 +154,45 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 .join("teams")
                 .join(team.team.id())
                 .join("drafts")
-                .join(team.human);
+                .join(&team.human);
             fs::create_dir_all(&base)?;
+            if let Request::Send(reference) = request {
+                if !reference
+                    .strip_prefix("letter-local-")
+                    .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    return Err(io::Error::other("Invalid draft reference"));
+                }
+                let copy = base.join(&reference).join("primary");
+                let draft: Draft = serde_json::from_slice(&fs::read(copy.join("editing.json"))?)?;
+                let pending = copy.join("send.json");
+                let prior: Option<operations::FrozenSend> = match fs::read(&pending) {
+                    Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e),
+                };
+                let intent = match prior {
+                    Some(i) if i.draft == draft => i,
+                    _ => operations::FrozenSend::new(&team.human, team.team.id(), draft)?,
+                };
+                let bytes = serde_json::to_vec(&intent)?;
+                let out = roots
+                    .state
+                    .join("teams")
+                    .join(team.team.id())
+                    .join("outbox")
+                    .join(&intent.key);
+                fs::create_dir_all(&out)?;
+                for dest in [out.join("intent.json"), pending] {
+                    let tmp = dest.with_extension("tmp");
+                    fs::write(&tmp, &bytes)?;
+                    fs::File::open(&tmp)?.sync_all()?;
+                    fs::rename(tmp, &dest)?;
+                }
+                operations::send_letter(&roots.state, &team.team, &team.remote, &intent)?;
+                fs::write(copy.join("sent"), &intent.key)?;
+                return Ok(Reply::Ready);
+            }
             if let Request::SaveDraft(mut draft) = request {
                 let dir = if draft.reference.is_empty() {
                     let mut serial = 1u64;
@@ -185,7 +233,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
             let mut drafts = Vec::new();
             for entry in fs::read_dir(base)? {
                 let path = entry?.path().join("primary/editing.json");
-                if path.is_file() {
+                if path.is_file() && !path.with_file_name("sent").exists() {
                     drafts.push(serde_json::from_slice(&fs::read(path)?)?)
                 }
             }

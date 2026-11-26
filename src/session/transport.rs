@@ -120,6 +120,8 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
                 | Request::Join(_)
                 | Request::Create { .. }
                 | Request::Identities { .. }
+                | Request::Send(_)
+                | Request::Published
                 | Request::Drafts
                 | Request::SaveDraft(_)
                 | Request::Workspace) => super::host::perform(&file, other),

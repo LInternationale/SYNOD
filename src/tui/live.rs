@@ -233,6 +233,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
         identities(t, &mut client, color)?;
     }
     let mut board = Bulletin::default();
+    let mut published = Vec::new();
     loop {
         let Reply::Drafts(drafts) = client.request(Request::Drafts)? else {
             return Err(io::Error::other("Missing draft list"));
@@ -244,7 +245,22 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 title: &d.title,
             })
             .collect();
-        let rows = BoardRows::new(&draft_views, &[]);
+        match client.request(Request::Published) {
+            Ok(Reply::Published(letters)) => published = letters,
+            Err(e) => {
+                notice(t, color, &format!("公告板同步失败：{e}"))?;
+            }
+            _ => return Err(io::Error::other("Missing publication list")),
+        };
+        let views: Vec<_> = published
+            .iter()
+            .map(|l| super::LetterView {
+                id: &l.id,
+                title: &l.title,
+                body: &l.body,
+            })
+            .collect();
+        let rows = BoardRows::new(&draft_views, &views);
         let action = loop {
             let area = t.draw(|f| board.render_with_theme(f, &rows, color))?.area;
             let e = input()?;
@@ -253,10 +269,21 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             }
         };
         match action {
-            BoardAction::Compose => compose(t, &mut client, color, Draft::default())?,
+            BoardAction::Compose => compose(t, &mut client, color, Draft::default(), &published)?,
+            BoardAction::QuickReply(id) => {
+                if let Some(letter) = published.iter().find(|l| l.id == id) {
+                    compose(
+                        t,
+                        &mut client,
+                        color,
+                        Draft::replying_to(letter, &published),
+                        &published,
+                    )?
+                }
+            }
             BoardAction::OpenDraft(reference) => {
                 if let Some(d) = drafts.iter().find(|d| d.reference == reference) {
-                    compose(t, &mut client, color, d.clone())?
+                    compose(t, &mut client, color, d.clone(), &published)?
                 }
             }
             BoardAction::Preferences => {
@@ -410,30 +437,56 @@ fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<bool> {
         }
     }
 }
-fn compose(t: &mut Term, client: &mut Client, c: ThemeColor, mut saved: Draft) -> io::Result<()> {
+fn compose(
+    t: &mut Term,
+    client: &mut Client,
+    c: ThemeColor,
+    mut saved: Draft,
+    board: &[PublishedLetter],
+) -> io::Result<()> {
+    let Reply::Team(Some(profile)) = client.request(Request::Profile)? else {
+        return Err(io::Error::other("Missing team roster"));
+    };
+    let roster = profile.team.roster();
+    let letters: Vec<_> = board
+        .iter()
+        .map(|l| (l.id.as_str(), l.title.as_str()))
+        .collect();
+    let mut editing = saved.clone();
     let mut form = Form::new(
         "写信",
-        vec![
-            field("标题", &saved.title),
-            field("收件人", &saved.to),
-            field("抄送", &saved.cc),
-            field("正文", &saved.body),
+        vec![field("标题", &editing.title), field("正文", &editing.body)],
+        &[
+            "收件人",
+            "抄送",
+            "引用",
+            "前置依赖",
+            "添加附件",
+            "存草稿",
+            "寄信",
         ],
-        &["存草稿"],
     );
     let mut msg = String::new();
     loop {
-        let action = form.interact(t, c, &msg)?;
-        let current = Draft {
-            reference: saved.reference.clone(),
-            title: form.val(0),
-            to: form.val(1),
-            cc: form.val(2),
-            body: form.val(3),
-        };
+        let summary = format!(
+            "收件人 {}  抄送 {}  引用 {}  前置依赖 {}  附件 {}\n{msg}",
+            editing.to,
+            editing.cc,
+            editing.references.len(),
+            editing.dependencies.len(),
+            editing
+                .attachments
+                .iter()
+                .map(|a| a.filename.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        );
+        let action = form.interact(t, c, &summary)?;
+        editing.title = form.val(0);
+        editing.body = form.val(1);
         match action {
             Action::Back => {
-                if current == saved
+                if editing == saved
                     || matches!(
                         Form::new("是否丢弃更改", vec![], &["继续编辑", "丢弃更改"])
                             .interact(t, c, "")?,
@@ -443,14 +496,69 @@ fn compose(t: &mut Term, client: &mut Client, c: ThemeColor, mut saved: Draft) -
                     return Ok(());
                 }
             }
-            Action::Button(_) => match client.request(Request::SaveDraft(current)) {
-                Ok(Reply::Saved(d)) => {
-                    saved = d;
-                    msg = "已存于本机".into()
+            Action::Button(0) => {
+                if let Some(v) = choose(t, c, "收件人", &roster, &[editing.to.clone()], false)? {
+                    editing.to = v.into_iter().next().unwrap_or_default()
                 }
-                Ok(_) => return Err(io::Error::other("Missing save acknowledgement")),
+            }
+            Action::Button(1) => {
+                let old = editing
+                    .cc
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>();
+                if let Some(v) = choose(t, c, "抄送", &roster, &old, true)? {
+                    editing.cc = v.join(",")
+                }
+            }
+            Action::Button(2) => {
+                if let Some(v) = choose(t, c, "引用", &letters, &editing.references, true)? {
+                    editing.references = v
+                }
+            }
+            Action::Button(3) => {
+                if let Some(v) = choose(t, c, "前置依赖", &letters, &editing.dependencies, true)?
+                {
+                    editing.dependencies = v
+                }
+            }
+            Action::Button(4) => match super::native_file::select() {
+                Ok(Some(a)) => editing.attachments.push(a),
+                Ok(None) => {}
                 Err(e) => msg = e.to_string(),
             },
+            Action::Button(button) => {
+                let send = button == 6;
+                if send
+                    && !matches!(
+                        Form::new("确认寄信", vec![], &["寄信", "返回"]).interact(
+                            t,
+                            c,
+                            &editing.title
+                        )?,
+                        Action::Button(0)
+                    )
+                {
+                    continue;
+                }
+                match client.request(Request::SaveDraft(editing.clone())) {
+                    Ok(Reply::Saved(d)) => {
+                        saved = d.clone();
+                        editing = d;
+                        msg = "已存于本机".into();
+                        if send {
+                            match client.request(Request::Send(saved.reference.clone())) {
+                                Ok(Reply::Ready) => return Ok(()),
+                                Err(e) => msg = e.to_string(),
+                                _ => return Err(io::Error::other("Missing send acknowledgement")),
+                            }
+                        }
+                    }
+                    Ok(_) => return Err(io::Error::other("Missing draft acknowledgement")),
+                    Err(e) => msg = e.to_string(),
+                }
+            }
         }
     }
 }
@@ -530,6 +638,94 @@ fn workspace(t: &mut Term, color: ThemeColor, root: &Path, names: &[String]) -> 
                 Ok(out) if out.status.success() => error.clear(),
                 Ok(out) => error = String::from_utf8_lossy(&out.stderr).into_owned(),
                 Err(e) => error = e.to_string(),
+            }
+        }
+    }
+}
+
+/// Edit a roster or reference selection without mutating the caller's values on Escape.
+fn choose(
+    t: &mut Term,
+    color: ThemeColor,
+    title: &str,
+    options: &[(&str, &str)],
+    existing: &[String],
+    multi: bool,
+) -> io::Result<Option<Vec<String>>> {
+    let mut values = existing.to_vec();
+    let mut focus = 0;
+    loop {
+        let count = options.len() + 1;
+        let mut hits = Vec::new();
+        t.draw(|f| {
+            let block = Block::bordered().title(title);
+            let inner = block.inner(f.area());
+            f.render_widget(block, f.area());
+            let start = (focus + 1usize).saturating_sub(usize::from(inner.height));
+            for (line, index) in (start..count).take(usize::from(inner.height)).enumerate() {
+                let rect = Rect::new(inner.x, inner.y + line as u16, inner.width, 1);
+                let text = if let Some((id, name)) = options.get(index) {
+                    format!(
+                        "{} {name}",
+                        if values.iter().any(|v| v == id) {
+                            "☑"
+                        } else {
+                            "☐"
+                        }
+                    )
+                } else {
+                    "确定".into()
+                };
+                let label = Paragraph::new(text);
+                f.render_widget(
+                    if focus == index {
+                        label.style(color.highlight())
+                    } else {
+                        label
+                    },
+                    rect,
+                );
+                hits.push((index, rect));
+            }
+        })?;
+        let activate = match input()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Up | KeyCode::BackTab => {
+                    focus = (focus + count - 1) % count;
+                    false
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    focus = (focus + 1) % count;
+                    false
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => true,
+                _ => false,
+            },
+            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((i, _)) = hits
+                    .iter()
+                    .find(|(_, r)| r.contains(Position::new(m.column, m.row)))
+                {
+                    focus = *i;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if activate {
+            let Some((id, _)) = options.get(focus) else {
+                return Ok(Some(values));
+            };
+            if !multi {
+                return Ok(Some(vec![id.to_string()]));
+            }
+            if values.iter().any(|v| v == id) {
+                values.retain(|v| v != id)
+            } else {
+                values.push(id.to_string())
             }
         }
     }

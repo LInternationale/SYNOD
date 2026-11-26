@@ -18,6 +18,8 @@ pub enum Request {
         human: String,
         assistant: String,
     },
+    Send(String),
+    Published,
     Drafts,
     SaveDraft(Draft),
     Workspace,
@@ -25,6 +27,7 @@ pub enum Request {
 }
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
+    Published(Vec<PublishedLetter>),
     Ready,
     Team(Option<Profile>),
     Drafts(Vec<Draft>),
@@ -41,11 +44,4 @@ pub struct Profile {
     pub assistant: String,
     pub remote: String,
 }
-#[derive(Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Draft {
-    pub reference: String,
-    pub title: String,
-    pub to: String,
-    pub cc: String,
-    pub body: String,
-}
+pub use crate::application::letters::{Attachment, Draft, PublishedLetter};

@@ -48,11 +48,29 @@ fn isolated_terminal() {
         bootstrap::initialize(&config, &root.join("state"), &root.join("work")).expect("roots");
     let mut c = ClientConfig::read(&config).expect("settings");
     let team = serde_json::from_str(include_str!("fixtures/v1/team/team.json")).expect("team");
+    let bare = root.join("remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .output()
+            .expect("init")
+            .status
+            .success()
+    );
+    let remote = bare.to_str().expect("path");
+    operations::publish_initial(
+        &roots.state,
+        remote,
+        &team,
+        &operations::freeze_initial("member-alice").expect("timestamp"),
+    )
+    .expect("publish");
     let profile = Profile {
         team,
         human: "member-alice".into(),
         assistant: String::new(),
-        remote: String::new(),
+        remote: remote.into(),
     };
     c.fields.insert(
         "profile".into(),
@@ -68,4 +86,79 @@ fn isolated_terminal() {
     }
     synod::tui::live::run(&config).expect("terminal");
     host.join().expect("host thread").expect("host");
+}
+
+#[test]
+fn sends_and_replies_with_frozen_attachments_and_independent_references() -> io::Result<()> {
+    use synod::session::protocol::{Attachment, Draft};
+    let root = std::env::temp_dir().join(format!("synod-send-{}", std::process::id()));
+    fs::create_dir(&root)?;
+    let bare = root.join("team.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .output()?
+            .status
+            .success()
+    );
+    let remote = bare.to_str().expect("fixture path");
+    let team: NewTeam = serde_json::from_str(include_str!("fixtures/v1/team/team.json"))?;
+    operations::publish_initial(
+        &root,
+        remote,
+        &team,
+        &operations::freeze_initial("member-alice")?,
+    )?;
+    let draft = Draft {
+        title: "Diagram".into(),
+        to: "member-chen".into(),
+        cc: "member-bob,assistant-chen".into(),
+        body: "Deliver figure".into(),
+        attachments: vec![Attachment {
+            filename: "图.png".into(),
+            bytes: vec![0, 255],
+        }],
+        ..Default::default()
+    };
+    let first = operations::FrozenSend::new("member-alice", team.id(), draft)?;
+    operations::send_letter(&root, &team, remote, &first)?;
+    operations::send_letter(&root, &team, remote, &first)?;
+    let board = operations::published_letters(&root, &team, remote)?;
+    assert_eq!(board.len(), 1);
+    let reply = Draft::replying_to(&board[0], &board);
+    assert_eq!(reply.to, "member-alice");
+    assert!(reply.dependencies.is_empty());
+    let second = operations::FrozenSend::new("member-chen", team.id(), reply)?;
+    operations::send_letter(&root, &team, remote, &second)?;
+    let board = operations::published_letters(&root, &team, remote)?;
+    let original = board
+        .iter()
+        .find(|l| l.title == "Diagram")
+        .expect("original");
+    assert_eq!(
+        Draft::replying_to(original, &board).title,
+        "Re: Diagram - 2"
+    );
+    let replied = board
+        .iter()
+        .find(|l| l.title == "Re: Diagram")
+        .expect("reply");
+    assert_eq!(Draft::replying_to(replied, &board).title, "Re: Re: Diagram");
+    let read = |path: String| {
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["show", &format!("main:{path}")])
+            .output()
+    };
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&read(format!("letters/{}/envelope.json", replied.id))?.stdout)?;
+    assert_eq!(envelope["references"][0], original.id);
+    assert_eq!(envelope["initial_dependencies"], serde_json::json!([]));
+    assert_eq!(
+        read(format!("letters/{}/attachments/asset-1", original.id))?.stdout,
+        vec![0, 255]
+    );
+    fs::remove_dir_all(root)
 }

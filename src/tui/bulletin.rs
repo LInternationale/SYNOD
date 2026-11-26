@@ -21,6 +21,7 @@ pub enum BoardAction<'a> {
     Preferences,
     Workspace,
     OpenDraft(&'a str),
+    QuickReply(String),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -30,20 +31,23 @@ enum Focus {
     Compose,
     Preferences,
     Workspace,
+    Reply,
 }
 
 impl Focus {
-    fn next(self) -> Self {
+    fn next(self, reply: bool) -> Self {
         match self {
             Self::List => Self::Compose,
             Self::Compose => Self::Preferences,
             Self::Preferences => Self::Workspace,
-            Self::Workspace => Self::List,
+            Self::Workspace if reply => Self::Reply,
+            Self::Workspace | Self::Reply => Self::List,
         }
     }
 
-    fn action(self) -> Option<BoardAction<'static>> {
+    fn action(self, selected: Option<&str>) -> Option<BoardAction<'static>> {
         match self {
+            Self::Reply => selected.map(|id| BoardAction::QuickReply(id.to_owned())),
             Self::List => None,
             Self::Compose => Some(BoardAction::Compose),
             Self::Preferences => Some(BoardAction::Preferences),
@@ -52,17 +56,19 @@ impl Focus {
     }
 }
 
-const BUTTONS: [(Focus, &str); 3] = [
+const BUTTONS: [(Focus, &str); 4] = [
     (Focus::Compose, "写信"),
     (Focus::Preferences, "偏好"),
     (Focus::Workspace, "工作区"),
+    (Focus::Reply, "快速回复"),
 ];
 
-fn layout(area: Rect) -> (Rect, [Rect; 3]) {
+fn layout(area: Rect, reply: bool) -> (Rect, std::rc::Rc<[Rect]>) {
+    let count = if reply { 4 } else { 3 };
     let [list, bar] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     (
         list,
-        Layout::horizontal([Constraint::Ratio(1, 3); 3]).areas(bar),
+        Layout::horizontal(vec![Constraint::Ratio(1, count); count as usize]).split(bar),
     )
 }
 
@@ -108,6 +114,12 @@ pub struct Bulletin {
 }
 
 impl Bulletin {
+    fn selected_letter(&self) -> Option<&str> {
+        match &self.screen {
+            BoardScreen::Board(key) => key.strip_prefix("letter:"),
+            _ => None,
+        }
+    }
     pub fn render(&mut self, frame: &mut Frame<'_>, rows: &BoardRows<'_>) {
         self.render_with_theme(frame, rows, super::preferences::ThemeColor::default());
     }
@@ -124,9 +136,9 @@ impl Bulletin {
             self.screen.render(frame, &views);
             return;
         }
-        let (list, buttons) = layout(frame.area());
+        let (list, buttons) = layout(frame.area(), self.selected_letter().is_some());
         self.screen.render_area(frame, list, &views, color);
-        for ((focus, label), area) in BUTTONS.into_iter().zip(buttons) {
+        for ((focus, label), area) in BUTTONS.into_iter().zip(buttons.iter().copied()) {
             let widget = Paragraph::new(label).centered();
             let widget = if focus == self.focus {
                 widget.style(color.highlight())
@@ -150,9 +162,9 @@ impl Bulletin {
                 if matches!(self.screen, BoardScreen::Detail(_)) {
                     self.screen.navigate(key.code, &views);
                 } else if key.code == KeyCode::Tab {
-                    self.focus = self.focus.next();
+                    self.focus = self.focus.next(self.selected_letter().is_some());
                 } else if key.code == KeyCode::Enter && self.focus != Focus::List {
-                    return self.focus.action();
+                    return self.focus.action(self.selected_letter());
                 } else if self.focus == Focus::List {
                     if key.code == KeyCode::Enter {
                         if let Some(draft) = self
@@ -171,14 +183,14 @@ impl Bulletin {
                     && !matches!(self.screen, BoardScreen::Detail(_)) =>
             {
                 let point = Position::new(mouse.column, mouse.row);
-                let (list, buttons) = layout(area);
+                let (list, buttons) = layout(area, self.selected_letter().is_some());
                 if list.contains(point) {
                     self.focus = Focus::List;
                 }
-                for ((focus, _), button) in BUTTONS.into_iter().zip(buttons) {
+                for ((focus, _), button) in BUTTONS.into_iter().zip(buttons.iter().copied()) {
                     if button.contains(point) {
                         self.focus = focus;
-                        return focus.action();
+                        return focus.action(self.selected_letter());
                     }
                 }
             }

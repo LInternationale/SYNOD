@@ -178,3 +178,319 @@ pub fn publish_initial(
         .trim();
     verify_initial(&work, root, &manifest, &message)
 }
+
+/// Read published originals at one fetched main revision. Reject incomplete or mismatched originals.
+pub fn published_letters(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+) -> io::Result<Vec<crate::application::letters::PublishedLetter>> {
+    use crate::application::letters::PublishedLetter;
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        letter_id: String,
+        title: String,
+        from: String,
+    }
+    let cache = root.join("teams").join(team.id()).join("repo.git");
+    std::fs::create_dir_all(&cache)?;
+    git(&cache, &["init", "--bare"])?;
+    git(
+        &cache,
+        &["fetch", "--no-tags", "--", remote, "refs/heads/main"],
+    )?;
+    let actual: NewTeam = serde_json::from_slice(&git(&cache, &["show", "FETCH_HEAD:team.json"])?)?;
+    actual.validate()?;
+    if actual.id() != team.id() {
+        return Err(io::Error::other("Repository team identity has changed"));
+    }
+    let paths = git(
+        &cache,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            "FETCH_HEAD",
+            "--",
+            "letters/",
+        ],
+    )?;
+    let mut result = Vec::new();
+    for path in paths.split(|b| *b == 0) {
+        let path = std::str::from_utf8(path).map_err(io::Error::other)?;
+        let Some(id) = path
+            .strip_prefix("letters/")
+            .and_then(|s| s.strip_suffix("/envelope.json"))
+        else {
+            continue;
+        };
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Err(io::Error::other("Invalid published letter path"));
+        }
+        let env: Envelope =
+            serde_json::from_slice(&git(&cache, &["show", &format!("FETCH_HEAD:{path}")])?)?;
+        if env.letter_id != id {
+            return Err(io::Error::other("Envelope and letter path disagree"));
+        }
+        let body = String::from_utf8(git(
+            &cache,
+            &["show", &format!("FETCH_HEAD:letters/{id}/body.md")],
+        )?)
+        .map_err(io::Error::other)?;
+        result.push(PublishedLetter {
+            id: env.letter_id,
+            title: env.title,
+            author: env.from,
+            body,
+        });
+    }
+    Ok(result)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct FrozenSend {
+    pub key: String,
+    pub timestamp: String,
+    pub actor: String,
+    pub team: String,
+    pub draft: crate::application::letters::Draft,
+}
+
+impl FrozenSend {
+    pub fn new(
+        actor: &str,
+        team: &str,
+        draft: crate::application::letters::Draft,
+    ) -> io::Result<Self> {
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            key: format!("{}-{}", time.as_nanos(), std::process::id()),
+            timestamp: freeze_initial(actor)?.timestamp,
+            actor: actor.into(),
+            team: team.into(),
+            draft,
+        })
+    }
+}
+
+fn commit_message(kind: &str, send: &FrozenSend, target: &str) -> io::Result<String> {
+    let quoted = |s: &str| toml::Value::String(s.to_owned()).to_string();
+    let msg = format!(
+        "kind = {}\n\nschema_version = 1\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n\n[target]\n{target}\n",
+        quoted(kind),
+        quoted(&send.team),
+        quoted(&format!("{kind}-{}", send.key)),
+        quoted(&send.actor),
+        send.timestamp
+    );
+    super::commit_message::decode(&msg).map_err(|e| io::Error::other(format!("{e:?}")))?;
+    Ok(msg)
+}
+fn commit(dir: &Path, msg: &str) -> io::Result<()> {
+    use std::{io::Write, process::Stdio};
+    let mut process = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["commit", "--cleanup=verbatim", "-F", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    process
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("Missing commit input"))?
+        .write_all(msg.as_bytes())?;
+    let out = process.wait_with_output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    let object = git(dir, &["cat-file", "commit", "HEAD"])?;
+    if !object
+        .windows(2)
+        .position(|b| b == b"\n\n")
+        .is_some_and(|p| &object[p + 2..] == msg.as_bytes())
+    {
+        return Err(io::Error::other("Commit message was modified"));
+    }
+    Ok(())
+}
+fn originals(s: &FrozenSend) -> io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    use std::collections::BTreeMap;
+    let mut files = BTreeMap::new();
+    let mut attachments = Vec::new();
+    for (index, a) in s.draft.attachments.iter().enumerate() {
+        let id = format!("asset-{}", index + 1);
+        attachments.push(serde_json::json!({"attachment_id":id,"filename":a.filename}));
+        files.insert(format!("attachments/{id}"), a.bytes.clone());
+    }
+    let cc: Vec<_> = s.draft.cc.split(',').filter(|v| !v.is_empty()).collect();
+    let env = serde_json::json!({"letter_id":format!("letter-{}",s.key),"from":s.actor,"to":s.draft.to,"cc":cc,"title":s.draft.title,"references":s.draft.references,"initial_dependencies":s.draft.dependencies,"attachments":attachments});
+    files.insert("envelope.json".into(), serde_json::to_vec_pretty(&env)?);
+    files.insert("body.md".into(), s.draft.body.as_bytes().to_vec());
+    Ok(files)
+}
+
+/// Publish the frozen draft using only ordinary fast-forward ref updates.
+pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) -> io::Result<()> {
+    use std::fs;
+    team.validate()?;
+    if team.id() != s.team
+        || !team.human(&s.actor)
+        || !s.key.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    {
+        return Err(io::Error::other("Invalid frozen send identity"));
+    }
+    let known = |id: &str| team.human(id) || team.assistant(id);
+    if s.draft.title.trim().is_empty()
+        || !known(&s.draft.to)
+        || !s.draft.cc.split(',').filter(|v| !v.is_empty()).all(known)
+    {
+        return Err(io::Error::other("Select a recipient and enter a title"));
+    }
+    let letter = format!("letter-{}", s.key);
+    let event = format!("evt-{}", s.key);
+    let prefix = format!("letters/{letter}");
+    let branch = format!("refs/heads/drafts/{}/{letter}/primary", s.actor);
+    let mut files = originals(s)?;
+    let event_path = format!("events/{event}.json");
+    let sent = serde_json::to_vec_pretty(
+        &serde_json::json!({"schema_version":1,"event_id":event,"letter_id":letter,"actor_id":s.actor,"occurred_at":s.timestamp,"kind":"LetterSent"}),
+    )?;
+    let draft_msg = commit_message(
+        "draft.saved",
+        s,
+        &format!("letter_id = \"{letter}\"\ncopy_id = \"primary\""),
+    )?;
+    let sent_msg = commit_message(
+        "letter.sent",
+        s,
+        &format!("letter_id = \"{letter}\"\nevent_id = \"{event}\""),
+    )?;
+    for round in 0..3 {
+        let board = published_letters(root, team, remote)?;
+        let cache = root.join("teams").join(team.id()).join("repo.git");
+        if board.iter().any(|l| l.id == letter) {
+            files.insert(event_path.clone(), sent.clone());
+            for (path, bytes) in &files {
+                if git(&cache, &["show", &format!("FETCH_HEAD:{prefix}/{path}")])? != *bytes {
+                    return Err(io::Error::other(
+                        "Published content differs from frozen send",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if board.iter().any(|l| l.title.trim() == s.draft.title.trim()) {
+            return Err(io::Error::other("队伍公告板已有同名信件，草稿已保留"));
+        }
+        if !s
+            .draft
+            .references
+            .iter()
+            .chain(&s.draft.dependencies)
+            .all(|id| board.iter().any(|l| l.id == *id))
+        {
+            return Err(io::Error::other("Referenced letter is missing from main"));
+        }
+        let base = git(&cache, &["rev-parse", "FETCH_HEAD"])?;
+        let base = std::str::from_utf8(&base).map_err(io::Error::other)?.trim();
+        let dir = root
+            .join("teams")
+            .join(team.id())
+            .join("worktrees")
+            .join(format!(
+                "send-{}-{}-{round}",
+                s.key,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(io::Error::other)?
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&dir)?;
+        git(&dir, &["init", "-b", "candidate"])?;
+        git(&dir, &["config", "user.name", &s.actor])?;
+        git(&dir, &["config", "user.email", "synod@localhost"])?;
+        git(
+            &dir,
+            &["fetch", "--no-tags", "--", remote, "refs/heads/main"],
+        )?;
+        if git(&dir, &["rev-parse", "FETCH_HEAD"])? != format!("{base}\n").as_bytes() {
+            continue;
+        }
+        git(&dir, &["switch", "--detach", base])?;
+        let draft_oid = if git(&dir, &["ls-remote", "--", remote, &branch])?.is_empty() {
+            for (path, bytes) in &files {
+                let dest = dir.join(&prefix).join(path);
+                fs::create_dir_all(
+                    dest.parent()
+                        .ok_or_else(|| io::Error::other("Missing parent"))?,
+                )?;
+                fs::write(dest, bytes)?
+            }
+            git(&dir, &["add", "--", &prefix])?;
+            commit(&dir, &draft_msg)?;
+            git(&dir, &["push", "--", remote, &format!("HEAD:{branch}")])?;
+            git(&dir, &["rev-parse", "HEAD"])?
+        } else {
+            git(&dir, &["fetch", "--no-tags", "--", remote, &branch])?;
+            for (path, bytes) in &files {
+                if git(&dir, &["show", &format!("FETCH_HEAD:{prefix}/{path}")])? != *bytes {
+                    return Err(io::Error::other("Cloud draft differs from frozen send"));
+                }
+            }
+            git(&dir, &["rev-parse", "FETCH_HEAD"])?
+        };
+        let draft_oid = std::str::from_utf8(&draft_oid)
+            .map_err(io::Error::other)?
+            .trim();
+        git(&dir, &["switch", "--detach", base])?;
+        git(&dir, &["merge", "--no-ff", "--no-commit", draft_oid])?;
+        let path = dir.join(&prefix).join(&event_path);
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| io::Error::other("Missing event parent"))?,
+        )?;
+        fs::write(path, &sent)?;
+        git(&dir, &["add", "--", &format!("{prefix}/{event_path}")])?;
+        let changes = git(&dir, &["diff", "--cached", "--name-only", "-z", base])?;
+        let changed: std::collections::BTreeSet<_> = changes
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let expected = files
+            .keys()
+            .chain(std::iter::once(&event_path))
+            .map(|p| format!("{prefix}/{p}"))
+            .collect();
+        if changed != expected {
+            return Err(io::Error::other("Unexpected candidate paths"));
+        }
+        commit(&dir, &sent_msg)?;
+        let parents = git(&dir, &["show", "-s", "--format=%P", "HEAD"])?;
+        if parents != format!("{base} {draft_oid}\n").as_bytes() {
+            return Err(io::Error::other("Invalid publication parents"));
+        }
+        match git(&dir, &["push", "--", remote, "HEAD:refs/heads/main"]) {
+            Ok(_) => {
+                let confirmed = published_letters(root, team, remote)?;
+                if confirmed.iter().any(|l| l.id == letter) {
+                    return Ok(());
+                }
+            }
+            Err(e) if round == 2 => return Err(e),
+            Err(_) => {}
+        }
+    }
+    Err(io::Error::other("Remote branch advanced; retry this send"))
+}

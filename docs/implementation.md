@@ -97,3 +97,15 @@ Executable checkpoint review: main.rs starts the interactive client or separate 
 The workspace view offers the confirmed system-folder action for the configured editable root. Use the platform opener with a single absolute path argument and no shell. Escape returns to the board; arrows scroll the preview. A focusable button and its rendered rectangle share keyboard and mouse activation. Review: a file name from the preview must never become an executable or shell input. Inject only the validated workspace root; keep opener failures visible without closing the workspace view.
 
 Workspace comparison: the live board opens the directory preview and the viewer dispatches both activations to the platform command. Cargo tests passed and nightly measured 98/278 branches across the workspace. The graphical system file manager was not launched during automated tests.
+
+## Reply composition and confirmed send
+
+The board offers quick reply on a selected published letter. New replies preselect the original author, cite the selected letter ID, and prepend Re: even when already present. Use the full board title index and the first free numbered suffix starting at 2. Compose chooses a single recipient and multiple CC members from the roster, and references from published letters independently of task dependencies. A native file picker supplies a path; read regular-file bytes into the draft so a moved original does not break it. New local fields default empty when loading older drafts. A send action asks once before submitting.
+
+Independent review: do not infer task edges from references; keep separate fields. Avoid interpolating filenames into shell or AppleScript. Use stable letter IDs for selection and attachment IDs for repository paths. Local drafts must survive failed publication. Check prefilled recipients, repeated prefixes, suffix collisions, multi-selection cancellation, legacy draft decoding and frozen attachments.
+
+## Git send path
+
+Before publication freeze unique operation/letter IDs, actor, team, immutable draft bytes and offset timestamp on disk. Create the cloud draft commit from main, and publish the sealed original and LetterSent via a two-parent fast-forward candidate. Preserve references separately from initial_dependencies. Validate addresses, reference/dependency targets and title on refreshed main. Retry from current main on a competing push. Confirm the same frozen object from remote main before hiding the local draft. Failure leaves the editing snapshot available. Workspace conflict choices are 推迟提交 and 解决冲突; the resolution interaction is pending clarification.
+
+Mail verification: live_client exercised real draft and two-parent send commits, idempotent retry, attachment byte equality, repeated Re: and collision suffixes, and separate envelope references. A PTY test selected a recipient and confirmed a send, then read letter.sent from the temporary remote main. Cargo tests passed. Nightly workspace branch coverage was 33.42%; this excludes external PTY interaction. No actual native graphical file dialog was opened by the tests.
