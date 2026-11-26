@@ -122,3 +122,49 @@ impl PendingTeam {
         })
     }
 }
+
+impl NewTeam {
+    pub fn id(&self) -> &str {
+        &self.team_id
+    }
+    pub fn human(&self, id: &str) -> bool {
+        self.members
+            .iter()
+            .any(|m| matches!(m.kind, MemberKind::Human) && m.actor_id == id)
+    }
+    pub fn assistant(&self, id: &str) -> bool {
+        self.members
+            .iter()
+            .any(|m| matches!(m.kind, MemberKind::Assistant) && m.actor_id == id)
+    }
+    pub fn roster(&self) -> Vec<(&str, &str)> {
+        self.members
+            .iter()
+            .map(|m| (m.actor_id.as_str(), m.display_name.as_str()))
+            .collect()
+    }
+    pub fn validate(&self) -> std::io::Result<()> {
+        fn safe(id: &str) -> bool {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        }
+        let mut actors = std::collections::HashSet::new();
+        let mut spaces = std::collections::HashSet::new();
+        if self.schema_version != 1
+            || !safe(&self.team_id)
+            || !self
+                .members
+                .iter()
+                .all(|m| safe(&m.actor_id) && actors.insert(&m.actor_id))
+            || !self
+                .spaces
+                .iter()
+                .all(|s| safe(&s.space_id) && spaces.insert(&s.space_id))
+        {
+            return Err(std::io::Error::other("Invalid team manifest"));
+        }
+        Ok(())
+    }
+}

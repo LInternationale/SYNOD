@@ -117,3 +117,6 @@ impl BoardScreen {
 pub mod bulletin;
 pub mod compose;
 pub mod preferences;
+
+#[cfg(unix)]
+pub mod live;
