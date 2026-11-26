@@ -129,8 +129,16 @@ impl ThemeForm {
     }
 
     fn areas(area: Rect) -> [Rect; 4] {
-        Layout::vertical([Constraint::Length(1); 4])
-            .areas(super::page("", ThemeColor::default()).inner(area))
+        let [r, g, b, _, bar, _] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(super::page("", ThemeColor::default()).inner(area));
+        [r, g, b, bar]
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
@@ -147,7 +155,7 @@ impl ThemeForm {
                 self.editor.active(),
             );
         }
-        let button = Paragraph::new("1 应用设置").centered();
+        let button = Paragraph::new("F1 应用设置").centered();
         frame.render_widget(
             if self.focus == 3 {
                 button.style(self.editor.active().highlight())

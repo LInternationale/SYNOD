@@ -150,18 +150,20 @@ impl Bulletin {
         let views = rows.views();
         self.screen.refresh(&views);
         if matches!(self.screen, BoardScreen::Detail(_)) {
-            self.screen.render_area(frame, frame.area(), &views, color);
+            self.screen
+                .render_area(frame, frame.area(), &views, color, true);
             return;
         }
         let (list, buttons) = layout(frame.area(), self.selected_letter().is_some());
-        self.screen.render_area(frame, list, &views, color);
+        self.screen
+            .render_area(frame, list, &views, color, self.focus == Focus::List);
         for ((focus, label), area) in BUTTONS.into_iter().zip(buttons.iter().copied()) {
             let ordinal = BUTTONS
                 .iter()
                 .position(|b| b.0 == focus)
                 .unwrap_or_default()
                 + 1;
-            let widget = Paragraph::new(format!("{ordinal} {label}")).centered();
+            let widget = Paragraph::new(format!("F{ordinal} {label}")).centered();
             let widget = if focus == self.focus {
                 widget.style(color.highlight())
             } else {

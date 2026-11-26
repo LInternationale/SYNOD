@@ -96,12 +96,12 @@ pub(super) fn run(
             let page = super::page("偏好", *color);
             let inner = page.inner(f.area());
             f.render_widget(page, f.area());
-            let [strip, info, fields, bar, status, hint] = Layout::vertical([
+            let [strip, info, fields, status, bar, hint] = Layout::vertical([
                 Constraint::Length(super::action_height(inner.width, 4)),
                 Constraint::Length(1),
                 Constraint::Min(0),
-                Constraint::Length(super::action_height(inner.width, actions.len())),
                 Constraint::Length(u16::from(!message.is_empty())),
+                Constraint::Length(super::action_height(inner.width, actions.len())),
                 Constraint::Length(1),
             ])
             .areas(inner);
@@ -126,7 +126,7 @@ pub(super) fn run(
             for (i, rect) in super::action_cells(bar, actions.len()).iter().enumerate() {
                 let id = 1 + values.len() + i;
                 f.render_widget(
-                    Paragraph::new(format!("{} {}", i + 1, actions[i]))
+                    Paragraph::new(format!("F{} {}", i + 1, actions[i]))
                         .centered()
                         .style(if focus == id {
                             color.highlight()

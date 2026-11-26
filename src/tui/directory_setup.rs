@@ -43,7 +43,7 @@ impl DirectorySetup {
         for (index, (label, rect)) in [
             ("本机状态目录", state),
             ("队伍工作目录", work),
-            ("1 完成配置", finish),
+            ("F1 完成配置", finish),
         ]
         .into_iter()
         .enumerate()
@@ -216,7 +216,7 @@ mod tests {
         terminal
             .draw(|f| setup.render(f, ThemeColor::default()))
             .unwrap();
-        assert_eq!(terminal.backend().buffer()[(20, 8)].symbol(), "完");
+        assert_eq!(terminal.backend().buffer()[(21, 8)].symbol(), "完");
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "首");
         assert!(

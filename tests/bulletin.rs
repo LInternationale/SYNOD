@@ -46,7 +46,7 @@ fn draft_precedes_publication_and_buttons_share_actions() -> Result<(), std::con
         (5, BoardAction::Compose),
         (15, BoardAction::Workspace),
         (25, BoardAction::Filter),
-        (35, BoardAction::Preferences),
+        (42, BoardAction::Preferences),
     ] {
         board.handle(key(KeyCode::Tab), area, &rows);
         terminal.draw(|f| board.render(f, &rows))?;
@@ -119,4 +119,27 @@ fn arrows_reach_actions_from_both_ends_of_the_list() {
             Some(expected)
         );
     }
+}
+
+#[test]
+fn footer_focus_clears_list_highlight_and_function_keys_open_actions() {
+    let letters = [LetterView {
+        id: "mail",
+        title: "First",
+        body: "",
+    }];
+    let rows = BoardRows::new(&[], &letters);
+    let area = Rect::new(0, 0, 60, 8);
+    let mut board = Bulletin::default();
+    let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+    terminal.draw(|f| board.render(f, &rows)).unwrap();
+    let highlighted = terminal.backend().buffer()[(0, 2)].bg;
+    board.handle(Event::Key(KeyCode::Tab.into()), area, &rows);
+    terminal.draw(|f| board.render(f, &rows)).unwrap();
+    assert_ne!(terminal.backend().buffer()[(0, 2)].bg, highlighted);
+    assert_eq!(terminal.backend().buffer()[(0, 6)].bg, highlighted);
+    assert_eq!(
+        board.handle(Event::Key(KeyCode::F(2).into()), area, &rows),
+        Some(BoardAction::Workspace)
+    );
 }

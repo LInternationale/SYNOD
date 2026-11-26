@@ -11,9 +11,9 @@ In application-authored Chinese interface copy, use an ASCII period followed by 
 
 ## Control design
 
-- For a required decision, distribute the choices across the entire available action row. For actions the user can enter or invoke, group buttons against the left edge. Give each button ten terminal columns and center its label within its hit area. Measure terminal display columns, including full-width characters.
-- Show each button as its working shortcut, a space, and its name. Number actions in page order starting at 1. Keep digits available for text entry; Alt+number activates the corresponding button while editing.
+- For a required decision, distribute the choices across the entire available action row. For actions the user can enter or invoke, group buttons against the left edge. Give each button twelve terminal columns and center its label within its hit area. Measure terminal display columns, including full-width characters.
+- Show each button as its working shortcut, a space, and its name. Place all action buttons on the penultimate row, with F1 through F10 in page order. Limit each page to ten buttons.
 - Show the current focus's available operations on the last row. Format hints as `space · 切换同步模式`. Update them when focus moves. Quick reply is a contextual `r` action on a selected published letter.
-- Draw every unchecked checkbox as □ and every checked checkbox as ■ in the applied theme color. Keep the square distinguishable when its label has focus.
+- Draw every unchecked checkbox as □ and every checked checkbox as ■ in the applied theme color. Keep the square distinguishable when its label has focus. For a commit-producing checkbox, Space stages and Enter submits. In multi-select lists Space toggles an item and Enter finishes the entire selection.
 - Escape returns one level. Preserve the active preferences tab when leaving a nested editor or picker. Input focus in the compose page highlights only the field identifier and its padding. Give the body identifier its own line.
 - Frame the workspace tree as an untitled control inside the borderless page. Distinguish tagged directories with both a visible marker and color.

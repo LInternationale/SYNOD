@@ -1,6 +1,5 @@
-//! Layout and keyboard state of the letter editor.
+//! Compose viewport and insertion-point navigation.
 use super::{
-    checkbox,
     live::{Action, Term, input},
     preferences::ThemeColor,
 };
@@ -17,41 +16,72 @@ use std::io;
 #[derive(Default)]
 pub(super) struct LetterEditor {
     focus: usize,
-    scroll: usize,
-    follow: bool,
+    editing: bool,
+    caret: usize,
+    offset: usize,
 }
-fn wrapped(text: &str, width: u16) -> Vec<String> {
-    let mut rows = vec![String::new()];
-    let mut x = 0;
-    for line in text.split('\n').enumerate() {
-        if line.0 > 0 {
-            rows.push(String::new());
-            x = 0;
-        }
-        for glyph in Span::raw(line.1).styled_graphemes(Style::default()) {
+
+struct VisualLine {
+    start: usize,
+    end: usize,
+}
+
+fn visual_lines(text: &str, width: usize) -> Vec<VisualLine> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut cols = 0;
+    let mut offset = 0;
+    for logical in text.split('\n') {
+        for glyph in Span::raw(logical).styled_graphemes(Style::default()) {
             let w = Span::raw(glyph.symbol).width();
-            if x > 0 && x + w > usize::from(width) {
-                rows.push(String::new());
-                x = 0
+            if cols > 0 && cols + w > width {
+                lines.push(VisualLine { start, end: offset });
+                start = offset;
+                cols = 0;
             }
-            if let Some(row) = rows.last_mut() {
-                row.push_str(glyph.symbol)
-            }
-            x += w;
+            cols += w;
+            offset += glyph.symbol.len();
         }
+        lines.push(VisualLine { start, end: offset });
+        if cols >= width {
+            lines.push(VisualLine {
+                start: offset,
+                end: offset,
+            });
+        }
+        offset += 1;
+        start = offset;
+        cols = 0;
     }
-    rows
+    lines
 }
-fn names(ids: impl Iterator<Item = impl AsRef<str>>, choices: &[(&str, &str)]) -> String {
-    ids.filter_map(|id| {
-        choices
-            .iter()
-            .find(|(key, _)| *key == id.as_ref())
-            .map(|(_, label)| *label)
-    })
-    .collect::<Vec<_>>()
-    .join("、")
+fn column_offset(text: &str, column: usize) -> usize {
+    let mut cols = 0;
+    let mut bytes = 0;
+    for glyph in Span::raw(text).styled_graphemes(Style::default()) {
+        cols += Span::raw(glyph.symbol).width();
+        if cols > column {
+            break;
+        }
+        bytes += glyph.symbol.len();
+    }
+    bytes
 }
+pub(super) fn names(
+    ids: impl Iterator<Item = impl AsRef<str>>,
+    choices: &[(&str, &str)],
+) -> String {
+    ids.filter(|id| !id.as_ref().is_empty())
+        .map(|id| {
+            choices
+                .iter()
+                .find(|(key, _)| *key == id.as_ref())
+                .map_or_else(|| id.as_ref().to_owned(), |(_, name)| name.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
 impl LetterEditor {
     pub(super) fn interact(
         &mut self,
@@ -66,319 +96,326 @@ impl LetterEditor {
             .iter()
             .map(|l| (l.id.as_str(), l.title.as_str()))
             .collect::<Vec<_>>();
-        let save = 6 + letters.len();
-        let count = save + 2;
         loop {
+            let save = 7 + d.attachments.len();
             let mut bounds = Vec::new();
-            let mut body_page = 1;
-            let mut max_scroll = 0;
+            let mut page = 1;
+            let mut end_body = 0;
+            let mut max_offset = 0;
+            let mut lines = Vec::new();
+            let mut cursor_row = 0;
             t.draw(|f| {
-                let frame = super::page("写信", color);
-                let area = frame.inner(f.area());
-                f.render_widget(frame, f.area());
-                let [main, feedback, buttons, hint] = Layout::vertical([
+                let header = super::page("写信", color);
+                let area = header.inner(f.area());
+                f.render_widget(header, f.area());
+                let [subject, view, status, bar, hint] = Layout::vertical([
+                    Constraint::Length(1),
                     Constraint::Min(0),
                     Constraint::Length(u16::from(!message.is_empty())),
-                    Constraint::Length(super::action_height(area.width, 2)),
+                    Constraint::Length(1),
                     Constraint::Length(1),
                 ])
                 .areas(area);
-                let mut rows = wrapped(&d.body, main.width.max(1));
-                if self.focus == 4
-                    && rows.last().is_some_and(|line| {
-                        Span::raw(line).width() >= usize::from(main.width.max(1))
-                    })
-                {
-                    rows.push(String::new());
-                }
-                let task_height = if letters.is_empty() {
-                    1
-                } else {
-                    1 + letters.len().min(4) as u16
-                };
-                let mut collapsed = self.scroll > 0;
-                if self.focus == 4 && self.follow {
-                    let available = main
-                        .height
-                        .saturating_sub(1 + 3 + 1 + task_height + 1)
-                        .max(1);
-                    collapsed = rows.len() > usize::from(available);
-                }
-                let [subject, headers, body_label, body, attachments, tasks] = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Length(if collapsed { 0 } else { 3 }),
-                    Constraint::Length(u16::from(!collapsed)),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                    Constraint::Length(task_height),
-                ])
-                .areas(main);
-                let field = |f: &mut ratatui::Frame<'_>,
-                             rect: Rect,
-                             label: &str,
-                             value: &str,
-                             active: bool| {
-                    let line = Line::from(vec![
+                let field = |label: &str, value: String, active| {
+                    Line::from(vec![
                         Span::styled(
-                            format!("{label}    "),
+                            format!(
+                                "{label}{}",
+                                " ".repeat(8usize.saturating_sub(Span::raw(label).width()))
+                            ),
                             if active {
                                 color.highlight()
                             } else {
                                 Style::default()
                             },
                         ),
-                        Span::raw(value.to_string()),
-                    ]);
-                    f.render_widget(Paragraph::new(line), rect);
+                        Span::raw(value),
+                    ])
                 };
-                field(f, subject, "标题", &d.title, self.focus == 0);
-                if self.focus == 0 && subject.width > 0 {
-                    let start = Span::raw("标题    ").width() as u16;
-                    let mut cols = 0usize;
-                    let available = subject.width.saturating_sub(start + 1) as usize;
-                    let mut tail = Vec::new();
+                f.render_widget(
+                    Paragraph::new(field("标题", d.title.clone(), self.focus == 0)),
+                    subject,
+                );
+                if self.focus == 0 && subject.width > 8 {
+                    let width = usize::from(subject.width - 9);
                     let title = Span::raw(&d.title);
                     let glyphs = title.styled_graphemes(Style::default()).collect::<Vec<_>>();
-                    for glyph in glyphs.iter().rev() {
-                        let w = Span::raw(glyph.symbol).width();
-                        if cols + w > available {
-                            break;
-                        }
-                        cols += w;
-                        tail.push(glyph.symbol);
-                    }
-                    tail.reverse();
-                    field(f, subject, "标题", &tail.concat(), true);
-                    if start < subject.width {
-                        let x = subject.x + start + cols as u16;
-                        f.render_widget(
-                            Span::styled("▏", Style::default().fg(color.rgb())),
-                            Rect::new(x, subject.y, 1, 1),
-                        );
-                        f.set_cursor_position((x, subject.y));
-                    }
+                    let mut used = 0;
+                    let start = glyphs
+                        .iter()
+                        .rposition(|g| {
+                            used += Span::raw(g.symbol).width();
+                            used > width
+                        })
+                        .map_or(0, |i| i + 1);
+                    let tail = glyphs[start..].iter().map(|g| g.symbol).collect::<String>();
+                    let x = subject.x + 8 + Span::raw(&tail).width() as u16;
+                    f.render_widget(Paragraph::new(field("标题", tail, true)), subject);
+                    f.render_widget(
+                        Span::styled("▏", Style::default().fg(color.rgb())),
+                        Rect::new(x, subject.y, 1, 1),
+                    );
+                    f.set_cursor_position((x, subject.y));
                 }
                 bounds.push((0, subject));
+                lines = visual_lines(&d.body, usize::from(view.width.max(1)));
+                cursor_row = lines
+                    .partition_point(|line| line.start <= self.caret)
+                    .saturating_sub(1);
+                page = usize::from(view.height.max(1));
+                let attachment_y = 5 + lines.len();
+                end_body = attachment_y.saturating_sub(page);
+                max_offset = (attachment_y + 1 + d.attachments.len()).saturating_sub(page);
+                if self.editing {
+                    let caret_y = 5 + cursor_row;
+                    self.offset = self
+                        .offset
+                        .min(caret_y)
+                        .max((caret_y + 1).saturating_sub(page));
+                } else if (6..save).contains(&self.focus) {
+                    let y = attachment_y + self.focus - 6;
+                    self.offset = self.offset.min(y).max((y + 1).saturating_sub(page));
+                }
+                self.offset = self.offset.min(max_offset);
+                let rect = |y: usize| {
+                    (y >= self.offset && y < self.offset + usize::from(view.height)).then(|| {
+                        Rect::new(view.x, view.y + (y - self.offset) as u16, view.width, 1)
+                    })
+                };
                 for (i, (label, value)) in [
                     ("收件", names(std::iter::once(&d.to), roster)),
                     ("抄送", names(d.cc.split(','), roster)),
                     ("引用", names(d.references.iter(), &refs)),
+                    ("子任务", names(d.dependencies.iter(), &refs)),
+                    ("正文", String::new()),
                 ]
                 .into_iter()
                 .enumerate()
                 {
-                    if i < usize::from(headers.height) {
-                        let rect = Rect::new(headers.x, headers.y + i as u16, headers.width, 1);
-                        field(f, rect, label, &value, self.focus == i + 1);
-                        bounds.push((i + 1, rect));
+                    if let Some(r) = rect(i) {
+                        f.render_widget(
+                            Paragraph::new(field(label, value, self.focus == i + 1)),
+                            r,
+                        );
+                        bounds.push((i + 1, r));
                     }
                 }
-                field(f, body_label, "正文", "", self.focus == 4);
-                body_page = usize::from(body.height.max(1));
-                max_scroll = rows
-                    .len()
-                    .saturating_sub(body_page)
-                    .max(usize::from(collapsed && rows.len() > 1));
-                if self.focus == 4 && self.follow {
-                    self.scroll = max_scroll;
-                } else {
-                    self.scroll = self.scroll.min(max_scroll);
+                for (i, line) in lines
+                    .iter()
+                    .enumerate()
+                    .skip(self.offset.saturating_sub(5))
+                    .take(page)
+                {
+                    if let Some(r) = rect(i + 5) {
+                        f.render_widget(Paragraph::new(&d.body[line.start..line.end]), r);
+                        bounds.push((5, r));
+                        if self.editing && i == cursor_row && r.width > 0 {
+                            let col = Span::raw(&d.body[line.start..self.caret]).width();
+                            let x = r.x + (col as u16).min(r.width - 1);
+                            f.buffer_mut()[(x, r.y)].set_style(color.highlight());
+                            f.set_cursor_position((x, r.y));
+                        }
+                    }
                 }
-                f.render_widget(
-                    Paragraph::new(
-                        rows.iter()
-                            .skip(self.scroll)
-                            .take(body_page)
-                            .cloned()
-                            .map(Line::raw)
-                            .collect::<Vec<_>>(),
-                    ),
-                    body,
-                );
-                if self.focus == 4 && self.scroll + body_page >= rows.len() && !body.is_empty() {
-                    let width = rows.last().map_or(0, |r| Span::raw(r).width());
-                    let x = body.x + (width as u16).min(body.width - 1);
-                    let y = body.y
-                        + ((rows.len() - 1).saturating_sub(self.scroll) as u16)
-                            .min(body.height - 1);
+                if let Some(r) = rect(attachment_y) {
                     f.render_widget(
-                        Span::styled("▏", Style::default().fg(color.rgb())),
-                        Rect::new(x, y, 1, 1),
+                        Paragraph::new(field("附件", String::new(), self.focus == 6)),
+                        r,
                     );
-                    f.set_cursor_position((x, y));
+                    bounds.push((6, r));
                 }
-                bounds.push((4, body));
-                let [add, list] = Layout::horizontal([Constraint::Length(10), Constraint::Min(0)])
-                    .areas(attachments);
-                f.render_widget(
-                    Paragraph::new("1 添加附件")
-                        .centered()
-                        .style(if self.focus == 5 {
-                            color.highlight()
-                        } else {
-                            Style::default()
-                        }),
-                    add,
-                );
-                f.render_widget(
-                    Paragraph::new(
-                        d.attachments
-                            .iter()
-                            .map(|a| a.filename.as_str())
-                            .collect::<Vec<_>>()
-                            .join("、"),
-                    ),
-                    list,
-                );
-                bounds.push((5, add));
-                f.render_widget(Paragraph::new("子任务"), tasks);
-                let visible = usize::from(tasks.height.saturating_sub(1));
-                let first = if (6..save).contains(&self.focus) {
-                    (self.focus - 5).saturating_sub(visible)
-                } else {
-                    0
-                };
-                for (i, l) in letters.iter().enumerate().skip(first).take(visible) {
-                    let rect = Rect::new(tasks.x, tasks.y + 1 + (i - first) as u16, tasks.width, 1);
-                    f.render_widget(
-                        Paragraph::new(checkbox(
-                            d.dependencies.contains(&l.id),
-                            &l.title,
-                            self.focus == 6 + i,
-                            color,
-                        )),
-                        rect,
-                    );
-                    bounds.push((6 + i, rect));
+                for (i, a) in d.attachments.iter().enumerate() {
+                    if let Some(r) = rect(attachment_y + 1 + i) {
+                        f.render_widget(
+                            Paragraph::new(a.filename.as_str()).style(if self.focus == 7 + i {
+                                color.highlight()
+                            } else {
+                                Style::default()
+                            }),
+                            r,
+                        );
+                        bounds.push((7 + i, r));
+                    }
                 }
-                for (i, label) in ["存草稿", "寄信"].iter().enumerate() {
-                    let rect = super::action_cells(buttons, 2)[i];
+                for (i, r) in super::action_cells(bar, 2).into_iter().enumerate() {
                     f.render_widget(
-                        Paragraph::new(format!("{} {label}", i + 2))
+                        Paragraph::new(["F1 存草稿", "F2 寄信"][i])
                             .centered()
                             .style(if self.focus == save + i {
                                 color.highlight()
                             } else {
                                 Style::default()
                             }),
-                        rect,
+                        r,
                     );
-                    bounds.push((save + i, rect));
+                    bounds.push((save + i, r));
                 }
                 let tip = match self.focus {
                     0 => "输入 · 编辑标题",
-                    1..=3 => "enter · 选择",
-                    4 => "PgUp/PgDn · 滚动正文",
-                    5 => "enter · 添加附件",
-                    n if n < save => "space · 切换子任务",
+                    1..=4 => "enter · 选择",
+                    5 if self.editing => "方向键 · 移动光标    esc · 结束编辑",
+                    5 => "↑↓ · 滚动正文    enter · 编辑正文",
+                    6 => "a · 添加附件",
+                    n if n < save => "x · 删除附件",
                     _ => "enter · 执行",
                 };
-                f.render_widget(Paragraph::new(message), feedback);
+                f.render_widget(Paragraph::new(message), status);
                 f.render_widget(Paragraph::new(tip), hint);
             })?;
-            let execute = match input()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                    _ if let Some(i) = super::shortcut(k, 3, matches!(self.focus, 0 | 4)) => {
-                        return Ok(Action::Button(4 + i));
+            let old = self.focus;
+            let mut activate = false;
+            match input()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    if let Some(i) = super::shortcut(k, 2, false) {
+                        return Ok(Action::Button(5 + i));
                     }
-                    KeyCode::Esc => return Ok(Action::Back),
-                    KeyCode::PageUp | KeyCode::PageDown => {
-                        self.follow = false;
-                        self.scroll = if k.code == KeyCode::PageUp {
-                            self.scroll.saturating_sub(body_page)
-                        } else {
-                            (self.scroll + body_page).min(max_scroll)
-                        };
-                        false
-                    }
-                    KeyCode::Enter if self.focus == 4 => {
-                        d.body.push('\n');
-                        self.follow = true;
-                        false
-                    }
-                    KeyCode::Char(ch) if matches!(self.focus, 0 | 4) => {
-                        if self.focus == 0 {
-                            d.title.push(ch)
-                        } else {
-                            d.body.push(ch);
-                            self.follow = true
+                    if self.editing {
+                        let line = &lines[cursor_row];
+                        let col = Span::raw(&d.body[line.start..self.caret]).width();
+                        match k.code {
+                            KeyCode::Esc => self.editing = false,
+                            KeyCode::Char(ch) => {
+                                d.body.insert(self.caret, ch);
+                                self.caret += ch.len_utf8();
+                            }
+                            KeyCode::Enter => {
+                                d.body.insert(self.caret, '\n');
+                                self.caret += 1;
+                            }
+                            KeyCode::Backspace | KeyCode::Left => {
+                                if let Some((p, _)) =
+                                    d.body[..self.caret].char_indices().next_back()
+                                {
+                                    if k.code == KeyCode::Backspace {
+                                        d.body.replace_range(p..self.caret, "");
+                                    }
+                                    self.caret = p;
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(c) = d.body[self.caret..].chars().next() {
+                                    self.caret += c.len_utf8();
+                                }
+                            }
+                            KeyCode::Delete => {
+                                if self.caret < d.body.len() {
+                                    d.body.remove(self.caret);
+                                }
+                            }
+                            KeyCode::Home => self.caret = line.start,
+                            KeyCode::End => self.caret = line.end,
+                            KeyCode::Up | KeyCode::Down => {
+                                let row = if k.code == KeyCode::Up {
+                                    cursor_row.saturating_sub(1)
+                                } else {
+                                    (cursor_row + 1).min(lines.len() - 1)
+                                };
+                                let l = &lines[row];
+                                self.caret = l.start + column_offset(&d.body[l.start..l.end], col);
+                            }
+                            _ => {}
                         }
-                        false
+                        continue;
                     }
-                    KeyCode::Backspace if matches!(self.focus, 0 | 4) => {
-                        if self.focus == 0 {
+                    match k.code {
+                        KeyCode::Esc => return Ok(Action::Back),
+                        KeyCode::Char(ch) if self.focus == 0 => d.title.push(ch),
+                        KeyCode::Backspace if self.focus == 0 => {
                             d.title.pop();
-                        } else {
-                            d.body.pop();
-                            self.follow = true
                         }
-                        false
-                    }
-                    KeyCode::Enter => true,
-                    KeyCode::Char(' ') if (6..save).contains(&self.focus) => true,
-                    KeyCode::Up if self.focus > 6 && self.focus < save => {
-                        self.focus -= 1;
-                        false
-                    }
-                    KeyCode::Down if self.focus >= 6 && self.focus + 1 < save => {
-                        self.focus += 1;
-                        false
-                    }
-                    code if let Some(next) =
-                        super::focus_step(code, self.focus, count, &bounds) =>
-                    {
-                        self.focus = next;
-                        if next < 4 {
-                            self.scroll = 0;
-                            self.follow = false
+                        KeyCode::Char('a') if self.focus == 6 => return Ok(Action::Button(4)),
+                        KeyCode::Char('x') if (7..save).contains(&self.focus) => {
+                            d.attachments.remove(self.focus - 7);
+                            self.focus = self.focus.min(save - 2);
                         }
-                        false
+                        KeyCode::Enter => activate = true,
+                        KeyCode::PageUp => {
+                            self.focus = 5;
+                            self.offset = self.offset.saturating_sub(page);
+                        }
+                        KeyCode::PageDown => {
+                            self.focus = 5;
+                            self.offset = (self.offset + page).min(end_body);
+                        }
+                        KeyCode::Up if self.focus == 5 && self.offset > 0 => self.offset -= 1,
+                        KeyCode::Down | KeyCode::Tab
+                            if self.focus == 5 && self.offset < end_body =>
+                        {
+                            self.offset += 1
+                        }
+                        KeyCode::Down | KeyCode::Tab if self.focus < save => self.focus += 1,
+                        KeyCode::Up | KeyCode::BackTab if self.focus > 0 && self.focus <= save => {
+                            self.focus -= 1
+                        }
+                        code if let Some(next) =
+                            super::focus_step(code, self.focus, save + 2, &bounds) =>
+                        {
+                            self.focus = next
+                        }
+                        _ => {}
                     }
-                    _ => false,
-                },
+                    if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
+                        continue;
+                    }
+                }
                 Event::Mouse(m)
                     if matches!(
                         m.kind,
-                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                     ) =>
                 {
-                    self.follow = false;
-                    self.scroll = if m.kind == MouseEventKind::ScrollUp {
-                        self.scroll.saturating_sub(3)
+                    self.editing = false;
+                    self.focus = 5;
+                    self.offset = if m.kind == MouseEventKind::ScrollUp {
+                        self.offset.saturating_sub(3)
                     } else {
-                        (self.scroll + 3).min(max_scroll)
+                        (self.offset + 3).min(max_offset)
                     };
-                    false
+                    continue;
                 }
                 Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some((i, _)) = bounds
+                    if let Some((id, _)) = bounds
                         .iter()
                         .find(|(_, r)| r.contains(Position::new(m.column, m.row)))
                     {
-                        self.focus = *i;
-                        !matches!(*i, 0 | 4)
-                    } else {
-                        false
+                        self.focus = *id;
+                        activate = true;
+                        self.editing = false;
                     }
                 }
-                _ => false,
-            };
-            if execute {
+                _ => {}
+            }
+            if self.focus <= 4 {
+                self.offset = 0;
+            }
+            if self.focus == 5 && (old != 5 || activate) {
+                self.editing = true;
+            }
+            if activate {
                 match self.focus {
-                    1..=3 => return Ok(Action::Button(self.focus - 1)),
-                    5 => return Ok(Action::Button(4)),
-                    n if (6..save).contains(&n) => {
-                        let id = &letters[n - 6].id;
-                        if d.dependencies.contains(id) {
-                            d.dependencies.retain(|v| v != id)
-                        } else {
-                            d.dependencies.push(id.clone())
-                        }
-                    }
+                    1..=4 => return Ok(Action::Button(self.focus - 1)),
                     n if n >= save => return Ok(Action::Button(5 + n - save)),
                     _ => {}
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wrapped_caret_respects_wide_characters_and_empty_lines() {
+        let text = "ab中\n\n末";
+        let rows = visual_lines(text, 3);
+        assert_eq!(
+            rows.iter()
+                .map(|r| &text[r.start..r.end])
+                .collect::<Vec<_>>(),
+            ["ab", "中", "", "末"]
+        );
+        assert_eq!(column_offset("中a", 1), 0);
+        assert_eq!(column_offset("中a", 2), 3);
     }
 }

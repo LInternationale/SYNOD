@@ -75,6 +75,7 @@ impl BoardScreen {
             frame.area(),
             letters,
             preferences::ThemeColor::default(),
+            true,
         );
     }
 
@@ -84,6 +85,7 @@ impl BoardScreen {
         area: ratatui::layout::Rect,
         letters: &[LetterView<'_>],
         color: preferences::ThemeColor,
+        focused: bool,
     ) {
         self.refresh(letters);
         let selection = self.position(letters);
@@ -97,7 +99,7 @@ impl BoardScreen {
         }
         let items = letters.iter().enumerate().map(|(index, letter)| {
             let item = ListItem::new(letter.title);
-            if Some(index) == selection {
+            if focused && Some(index) == selection {
                 item.style(color.highlight())
             } else {
                 item
@@ -239,36 +241,28 @@ fn checkbox<'a>(
 #[cfg(unix)]
 mod letter_editor;
 
-fn shortcut(key: crossterm::event::KeyEvent, count: usize, editing: bool) -> Option<usize> {
-    use crossterm::event::KeyModifiers;
-    let KeyCode::Char(ch) = key.code else {
-        return None;
-    };
-    if !ch.is_ascii_digit()
-        || key.modifiers.contains(KeyModifiers::CONTROL)
-        || (editing && !key.modifiers.contains(KeyModifiers::ALT))
-    {
-        return None;
-    }
-    let index = ch.to_digit(10)?.checked_sub(1)? as usize;
+fn shortcut(key: crossterm::event::KeyEvent, count: usize, _editing: bool) -> Option<usize> {
+    let KeyCode::F(n) = key.code else { return None };
+    let index = usize::from(n.checked_sub(1)?);
     (index < count).then_some(index)
 }
-fn action_height(width: u16, count: usize) -> u16 {
-    count.div_ceil(usize::from((width / 10).max(1))) as u16
+fn action_height(_width: u16, count: usize) -> u16 {
+    u16::from(count > 0)
 }
 fn action_cells(area: ratatui::layout::Rect, count: usize) -> Vec<ratatui::layout::Rect> {
-    let cols = usize::from((area.width / 10).max(1));
+    let width = area.width.min(12 * count as u16);
     (0..count)
         .map(|i| {
+            let x = usize::from(width) * i / count;
+            let end = usize::from(width) * (i + 1) / count;
             ratatui::layout::Rect::new(
-                area.x + (i % cols) as u16 * 10,
-                area.y + (i / cols) as u16,
-                area.width.min(10),
-                u16::from(i / cols < usize::from(area.height)),
+                area.x + x as u16,
+                area.y,
+                (end - x) as u16,
+                area.height.min(1),
             )
         })
         .collect()
 }
-
 #[cfg(unix)]
 mod settings_tabs;

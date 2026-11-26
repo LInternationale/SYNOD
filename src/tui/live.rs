@@ -105,10 +105,10 @@ impl<'a> Form<'a> {
                 let [help_area, inner] =
                     Layout::vertical([Constraint::Length(h), Constraint::Min(0)]).areas(inner);
                 f.render_widget(help, help_area);
-                let [fields, bar, status, hint] = Layout::vertical([
+                let [fields, status, bar, hint] = Layout::vertical([
                     Constraint::Min(0),
-                    Constraint::Length(1),
                     Constraint::Length(u16::from(!message.is_empty())),
+                    Constraint::Length(1),
                     Constraint::Length(1),
                 ])
                 .areas(inner);
@@ -147,7 +147,7 @@ impl<'a> Form<'a> {
                 .split(bar);
                 for (i, (label, rect)) in self.buttons.iter().zip(zones.iter()).enumerate() {
                     let idx = self.fields.len() + i;
-                    let w = Paragraph::new(format!("{} {label}", i + 1)).centered();
+                    let w = Paragraph::new(format!("F{} {label}", i + 1)).centered();
                     f.render_widget(
                         if idx == self.focus {
                             w.style(color.highlight())
@@ -630,6 +630,12 @@ fn compose(
                     editing.references = v
                 }
             }
+            Action::Button(3) => {
+                if let Some(v) = choose(t, c, "子任务设置", &letters, &editing.dependencies, true)?
+                {
+                    editing.dependencies = v;
+                }
+            }
             Action::Button(4) => match super::native_file::select() {
                 Ok(Some(a)) => editing.attachments.push(a),
                 Ok(None) => {}
@@ -639,7 +645,26 @@ fn compose(
                 let send = button == 6;
                 if send
                     && !matches!(
-                        Form::new("确认寄信", vec![], &["寄信"]).interact(t, c, &editing.title)?,
+                        {
+                            let summary = format!(
+                                "标题  {}\n收件  {}\n抄送  {}\n引用  {}\n子任务  {}\n附件  {}\n\n{}",
+                                editing.title,
+                                super::letter_editor::names(std::iter::once(&editing.to), &roster),
+                                super::letter_editor::names(editing.cc.split(','), &roster),
+                                super::letter_editor::names(editing.references.iter(), &letters),
+                                super::letter_editor::names(editing.dependencies.iter(), &letters),
+                                editing
+                                    .attachments
+                                    .iter()
+                                    .map(|a| a.filename.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("、"),
+                                editing.body
+                            );
+                            let mut confirm = Form::new("确认寄信", vec![], &["寄信"]);
+                            confirm.help = &summary;
+                            confirm.interact(t, c, "")?
+                        },
                         Action::Button(0)
                     )
                 {
@@ -737,10 +762,10 @@ pub(super) fn workspace(
             } else {
                 inner
             };
-            let [tree, bar, feedback, footer] = Layout::vertical([
+            let [tree, feedback, bar, footer] = Layout::vertical([
                 Constraint::Min(0),
-                Constraint::Length(super::action_height(inner.width, labels.len())),
                 Constraint::Length(u16::from(!status.is_empty())),
+                Constraint::Length(super::action_height(inner.width, labels.len())),
                 Constraint::Length(1),
             ])
             .areas(inner);
@@ -799,7 +824,7 @@ pub(super) fn workspace(
                 .zip(super::action_cells(bar, labels.len()).iter())
                 .enumerate()
             {
-                let w = Paragraph::new(format!("{} {label}", i + 1)).centered();
+                let w = Paragraph::new(format!("F{} {label}", i + 1)).centered();
                 f.render_widget(
                     if focus == i + 1 {
                         w.style(color.highlight())
@@ -1092,13 +1117,13 @@ fn filter_page(t: &mut Term, color: ThemeColor, filter: &mut [bool; 2]) -> io::R
                 rows.push((i, row));
             }
             f.render_widget(
-                Paragraph::new("space · 切换筛选    esc · 返回"),
+                Paragraph::new("space · 切换筛选    enter · 完成选择"),
                 Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
             );
         })?;
         match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                KeyCode::Esc => return Ok(()),
+                KeyCode::Esc | KeyCode::Enter => return Ok(()),
                 KeyCode::Char(' ') => {}
                 code if let Some(next) = super::focus_step(code, focus, 3, &rows) => {
                     focus = next;
@@ -1134,93 +1159,102 @@ fn choose(
     multi: bool,
 ) -> io::Result<Option<Vec<String>>> {
     let mut values = existing.to_vec();
-    let mut focus = 0;
+    let mut focus = 0usize;
     loop {
-        let count = options.len() + 1;
         let mut hits = Vec::new();
         t.draw(|f| {
-            let block = super::page(title, color);
-            let inner = block.inner(f.area());
-            f.render_widget(block, f.area());
-            let [inner, footer] =
-                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-            f.render_widget(
-                Paragraph::new(if focus == options.len() {
-                    "enter · 确定"
-                } else if multi {
-                    "space · 切换选择"
-                } else {
-                    "enter · 选择"
-                }),
-                footer,
-            );
-            let start = (focus + 1usize).saturating_sub(usize::from(inner.height));
-            for (line, index) in (start..count).take(usize::from(inner.height)).enumerate() {
-                let rect = Rect::new(inner.x, inner.y + line as u16, inner.width, 1);
-                let label = if let Some((id, name)) = options.get(index) {
+            let header = super::page(title, color);
+            let area = header.inner(f.area());
+            f.render_widget(header, f.area());
+            let [list, bar, hint] = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            let first = (focus.min(options.len().saturating_sub(1)) + 1)
+                .saturating_sub(usize::from(list.height));
+            for (i, (id, name)) in options
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(usize::from(list.height))
+            {
+                let r = Rect::new(list.x, list.y + (i - first) as u16, list.width, 1);
+                f.render_widget(
                     Paragraph::new(super::checkbox(
                         values.iter().any(|v| v == id),
                         *name,
-                        focus == index,
+                        focus == i,
                         color,
-                    ))
-                } else {
-                    Paragraph::new("1 确定")
-                        .centered()
-                        .style(if focus == index {
-                            color.highlight()
-                        } else {
-                            Default::default()
-                        })
-                };
-                f.render_widget(label, rect);
-                hits.push((index, rect));
+                    )),
+                    r,
+                );
+                hits.push((i, r));
             }
+            f.render_widget(
+                Paragraph::new("F1 确定")
+                    .centered()
+                    .style(if focus == options.len() {
+                        color.highlight()
+                    } else {
+                        Default::default()
+                    }),
+                bar,
+            );
+            hits.push((options.len(), bar));
+            f.render_widget(
+                Paragraph::new(if multi {
+                    "space · 勾选    enter · 完成选择"
+                } else {
+                    "enter · 选择"
+                }),
+                hint,
+            );
         })?;
-        let activate = match input()? {
+        match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                _ if super::shortcut(k, 1, false).is_some() => return Ok(Some(values)),
                 KeyCode::Esc => return Ok(None),
+                KeyCode::F(1) => return Ok(Some(values)),
+                KeyCode::Enter if multi || focus == options.len() => return Ok(Some(values)),
+                KeyCode::Down => {
+                    focus = (focus + 1).min(options.len());
+                    continue;
+                }
                 KeyCode::Up => {
                     focus = focus.saturating_sub(1);
-                    false
+                    continue;
                 }
-                KeyCode::Down => {
-                    focus = (focus + 1).min(count - 1);
-                    false
-                }
-                code if let Some(next) = super::focus_step(code, focus, count, &hits) => {
+                KeyCode::Char(' ') | KeyCode::Enter => {}
+                code if let Some(next) =
+                    super::focus_step(code, focus, options.len() + 1, &hits) =>
+                {
                     focus = next;
-                    false
+                    continue;
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => true,
-                _ => false,
+                _ => continue,
             },
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((i, _)) = hits
+                let Some((i, _)) = hits
                     .iter()
                     .find(|(_, r)| r.contains(Position::new(m.column, m.row)))
-                {
-                    focus = *i;
-                    true
-                } else {
-                    false
-                }
+                else {
+                    continue;
+                };
+                focus = *i;
             }
-            _ => false,
+            _ => continue,
+        }
+        let Some((id, _)) = options.get(focus) else {
+            return Ok(Some(values));
         };
-        if activate {
-            let Some((id, _)) = options.get(focus) else {
-                return Ok(Some(values));
-            };
-            if !multi {
-                return Ok(Some(vec![id.to_string()]));
-            }
-            if values.iter().any(|v| v == id) {
-                values.retain(|v| v != id)
-            } else {
-                values.push(id.to_string())
-            }
+        if !multi {
+            return Ok(Some(vec![id.to_string()]));
+        }
+        if values.iter().any(|v| v == id) {
+            values.retain(|v| v != id)
+        } else {
+            values.push(id.to_string())
         }
     }
 }
@@ -1234,6 +1268,10 @@ fn task_detail(
     board: &[LetterRow],
 ) -> io::Result<()> {
     use crate::application::letters::TaskChange;
+    let Reply::Team(Some(profile)) = client.request(Request::Profile)? else {
+        return Err(io::Error::other("Missing team roster"));
+    };
+    let roster = profile.team.roster();
     let mut letter = initial.clone();
     let mut staged = letter.completed;
     let mut ticks: Vec<_> = letter.checklist.iter().map(|i| i.checked).collect();
@@ -1243,39 +1281,55 @@ fn task_detail(
     let mut scroll = 0u16;
     loop {
         let mut bounds = Vec::new();
+        let mut max_scroll = 0;
         t.draw(|f| {
             let outer = super::page(&letter.title, color);
             let inner = outer.inner(f.area());
             f.render_widget(outer, f.area());
             let show_progress = !letter.dependencies.is_empty() || !letter.checklist.is_empty();
-            let [meter, body, bar, feedback, footer] = Layout::vertical([
-                Constraint::Length(u16::from(show_progress)),
+            let [addresses, progress, body, feedback, bar, footer] = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Length(1),
                 Constraint::Min(0),
-                Constraint::Length(super::action_height(inner.width, 2)),
                 Constraint::Length(u16::from(!message.is_empty())),
+                Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .areas(inner);
+            let names = super::letter_editor::names;
+            let addresses_text = format!(
+                "发件人  {}\n收件人  {}\n抄送  {}",
+                names(std::iter::once(&letter.author), &roster),
+                names(std::iter::once(&letter.to), &roster),
+                super::letter_editor::names(letter.cc.iter(), &roster)
+            );
+            f.render_widget(Paragraph::new(addresses_text), addresses);
+            let [check, meter] =
+                Layout::horizontal([Constraint::Length(10), Constraint::Min(0)]).areas(progress);
+            f.render_widget(
+                Paragraph::new(super::checkbox(staged, "完成", focus == 0, color)),
+                check,
+            );
+            bounds.push((0, check));
             if show_progress {
+                let [r, g, b] = color.0;
                 f.render_widget(
                     ratatui::widgets::Gauge::default()
-                        .gauge_style(color.highlight())
-                        .ratio(letter.progress_done as f64 / letter.progress_total as f64)
+                        .gauge_style(
+                            ratatui::style::Style::default()
+                                .fg(color.rgb())
+                                .bg(ratatui::style::Color::Rgb(r / 4, g / 4, b / 4)),
+                        )
+                        .ratio(letter.progress_done as f64 / letter.progress_total.max(1) as f64)
                         .label(format!(
-                            "任务进度  {}/{}  ({}%)",
-                            letter.progress_done, letter.progress_total, letter.progress
+                            "{}/{}",
+                            letter.progress_done, letter.progress_total
                         )),
                     meter,
                 );
             }
-            let mut text = format!(
-                "发件人  {}\n收件人  {}\n抄送  {}\n",
-                letter.author,
-                letter.to,
-                letter.cc.join("、")
-            );
-            let mut lines: Vec<ratatui::text::Line> =
-                text.split('\n').map(|s| s.to_owned().into()).collect();
+            let mut text = String::new();
+            let mut lines: Vec<ratatui::text::Line> = Vec::new();
             let mut positions = Vec::new();
             let mut next_item = letter.checklist.iter().enumerate().peekable();
             for (line, raw) in letter.body.lines().enumerate() {
@@ -1307,22 +1361,6 @@ fn task_detail(
                     );
                 }
             }
-            for event in letter
-                .events
-                .iter()
-                .filter(|e| matches!(e.kind.as_str(), "MarkedCompleted" | "MarkedIncomplete"))
-            {
-                text.push_str(&format!(
-                    "\n{}  {}  {}",
-                    event.occurred_at,
-                    event.actor_id,
-                    if event.kind == "MarkedCompleted" {
-                        "标记完成"
-                    } else {
-                        "取消完成"
-                    }
-                ));
-            }
             lines.extend(text.lines().map(|s| s.to_owned().into()));
             let heights: Vec<_> = lines
                 .iter()
@@ -1341,10 +1379,11 @@ fn task_detail(
                     .max(y.saturating_sub(body.height.saturating_sub(1)));
             }
             reveal = false;
-            scroll = scroll.min(heights.last().map_or(0, |h| {
+            max_scroll = heights.last().map_or(0, |h| {
                 h.1.saturating_sub(body.height as usize)
                     .min(u16::MAX as usize) as u16
-            }));
+            });
+            scroll = scroll.min(max_scroll);
             for (id, line) in positions {
                 let (start, end) = heights[line];
                 let from = start.max(scroll as usize);
@@ -1367,34 +1406,24 @@ fn task_detail(
                     .scroll((scroll, 0)),
                 body,
             );
-            let zones = super::action_cells(bar, 2);
-            for (i, (label, rect)) in ["任务完成", "进度设置"]
-                .iter()
-                .zip(zones.iter())
-                .enumerate()
-            {
-                let w = if i == 0 {
-                    Paragraph::new(super::checkbox(staged, *label, focus == 0, color))
-                } else {
-                    Paragraph::new(format!("1 {label}"))
-                }
-                .centered();
-                f.render_widget(
-                    if i != 0 && i == focus {
-                        w.style(color.highlight())
+            let rect = super::action_cells(bar, 1)[0];
+            f.render_widget(
+                Paragraph::new("F1 子任务设置")
+                    .centered()
+                    .style(if focus == 1 {
+                        color.highlight()
                     } else {
-                        w
-                    },
-                    *rect,
-                );
-                bounds.push((i, *rect));
-            }
+                        Default::default()
+                    }),
+                rect,
+            );
+            bounds.push((1, rect));
             f.render_widget(Paragraph::new(message.as_str()), feedback);
             f.render_widget(
                 Paragraph::new(if focus == 1 {
                     "enter · 设置子任务"
                 } else {
-                    "space · 切换勾选    enter · 提交"
+                    "space · 切换勾选    enter · 提交    PgUp/PgDn · 滚动正文"
                 }),
                 footer,
             );
@@ -1424,19 +1453,30 @@ fn task_detail(
                     false
                 }
                 KeyCode::Enter => true,
-                KeyCode::Up if focus > 2 => {
-                    focus -= 1;
-                    reveal = true;
+                KeyCode::Down if focus != 1 => {
+                    let next = if focus == 0 { 2 } else { focus + 1 };
+                    if next < ticks.len() + 2 && bounds.iter().any(|(id, _)| *id == next) {
+                        focus = next;
+                    } else if scroll < max_scroll {
+                        scroll += 1;
+                    } else {
+                        focus = 1;
+                    }
                     false
                 }
-                KeyCode::Down if focus >= 2 && focus < ticks.len() + 1 => {
-                    focus += 1;
-                    reveal = true;
-                    false
-                }
-                KeyCode::Up if focus < 2 && !ticks.is_empty() => {
-                    focus = ticks.len() + 1;
-                    reveal = true;
+                KeyCode::Up if focus != 0 => {
+                    let prev = if focus == 1 {
+                        ticks.len() + 1
+                    } else {
+                        focus - 1
+                    };
+                    if prev >= 2 && bounds.iter().any(|(id, _)| *id == prev) {
+                        focus = prev;
+                    } else if scroll > 0 {
+                        scroll -= 1;
+                    } else {
+                        focus = 0;
+                    }
                     false
                 }
                 code if let Some(next) =
@@ -1448,6 +1488,19 @@ fn task_detail(
                 }
                 _ => false,
             },
+            Event::Mouse(m)
+                if matches!(
+                    m.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                scroll = if m.kind == MouseEventKind::ScrollUp {
+                    scroll.saturating_sub(3)
+                } else {
+                    scroll.saturating_add(3)
+                };
+                false
+            }
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((i, _)) = bounds
                     .iter()
@@ -1492,14 +1545,8 @@ fn task_detail(
                 .filter(|l| l.id != letter.id)
                 .map(|l| (l.id.as_str(), l.title.as_str()))
                 .collect::<Vec<_>>();
-            let Some(selected) = choose(
-                t,
-                color,
-                "进度设置 · 选择子任务",
-                &options,
-                &letter.dependencies,
-                true,
-            )?
+            let Some(selected) =
+                choose(t, color, "子任务设置", &options, &letter.dependencies, true)?
             else {
                 continue;
             };
