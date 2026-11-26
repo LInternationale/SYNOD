@@ -22,12 +22,17 @@ pub enum Request {
     Published,
     Drafts,
     SaveDraft(Draft),
+    WorkspaceAction {
+        space: String,
+        action: WorkAction,
+    },
     Workspace,
     Close,
 }
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
     Published(Vec<PublishedLetter>),
+    Work(WorkResult),
     Ready,
     Team(Option<Profile>),
     Drafts(Vec<Draft>),
@@ -45,3 +50,21 @@ pub struct Profile {
     pub remote: String,
 }
 pub use crate::application::letters::{Attachment, Draft, PublishedLetter};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum WorkAction {
+    Save,
+    Submit,
+    SaveAndSubmit,
+    Defer,
+    Resolve,
+    ResolveOnTerminal(String),
+}
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorkResult {
+    Saved,
+    Published,
+    Dirty,
+    Conflict,
+    Deferred,
+}

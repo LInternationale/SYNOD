@@ -124,6 +124,7 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
                 | Request::Published
                 | Request::Drafts
                 | Request::SaveDraft(_)
+                | Request::WorkspaceAction { .. }
                 | Request::Workspace) => super::host::perform(&file, other),
                 Request::Hello(..) => Err(io::Error::other("Session already connected")),
             }

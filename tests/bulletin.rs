@@ -75,3 +75,22 @@ fn draft_precedes_publication_and_buttons_share_actions() -> Result<(), std::con
     assert_eq!(board.handle(Event::Resize(80, 24), area, &rows), None);
     Ok(())
 }
+
+#[test]
+fn quick_reply_targets_the_selected_published_letter() {
+    let letters = [LetterView {
+        id: "letter-18",
+        title: "Figure",
+        body: "Body",
+    }];
+    let rows = BoardRows::new(&[], &letters);
+    let mut board = Bulletin::default();
+    let area = Rect::new(0, 0, 60, 8);
+    for _ in 0..4 {
+        board.handle(Event::Key(KeyCode::Tab.into()), area, &rows);
+    }
+    assert_eq!(
+        board.handle(Event::Key(KeyCode::Enter.into()), area, &rows),
+        Some(BoardAction::QuickReply("letter-18".into()))
+    );
+}

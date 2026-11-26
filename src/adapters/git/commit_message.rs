@@ -22,6 +22,7 @@ pub enum Operation {
     DraftSaved(DraftTarget),
     LetterSent(SentTarget),
     LetterEvent(EventTarget),
+    WorkspaceSaved(SpaceTarget),
     WorkspacePublished(SpaceTarget),
 }
 
@@ -90,6 +91,9 @@ pub fn decode(message: &str) -> Result<TeamCommit, DecodeError> {
         ("letter.event", Some(t)) => {
             Operation::LetterEvent(t.try_into().map_err(DecodeError::Toml)?)
         }
+        ("workspace.saved", Some(t)) => {
+            Operation::WorkspaceSaved(t.try_into().map_err(DecodeError::Toml)?)
+        }
         ("workspace.published", Some(t)) => {
             Operation::WorkspacePublished(t.try_into().map_err(DecodeError::Toml)?)
         }
@@ -98,6 +102,7 @@ pub fn decode(message: &str) -> Result<TeamCommit, DecodeError> {
             | "draft.saved"
             | "letter.sent"
             | "letter.event"
+            | "workspace.saved"
             | "workspace.published",
             _,
         ) => return Err(DecodeError::Target),

@@ -308,7 +308,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             }
             BoardAction::Workspace => {
                 if let Reply::Files(names) = client.request(Request::Workspace)? {
-                    workspace(t, color, &roots.work, &names)?;
+                    workspace(t, &mut client, color, &roots.work, &names)?;
                 }
             }
         }
@@ -563,14 +563,20 @@ fn compose(
     }
 }
 
-fn workspace(t: &mut Term, color: ThemeColor, root: &Path, names: &[String]) -> io::Result<()> {
-    let mut button = false;
+fn workspace(
+    t: &mut Term,
+    client: &mut Client,
+    color: ThemeColor,
+    root: &Path,
+    names: &[String],
+) -> io::Result<()> {
+    let mut focus = 0;
     let mut offset = 0usize;
-    let mut error = String::new();
+    let mut status = String::new();
     loop {
-        let mut hit = Rect::default();
+        let mut hits = Vec::new();
         t.draw(|f| {
-            let [tree, action, status] = Layout::vertical([
+            let [tree, bar, message] = Layout::vertical([
                 Constraint::Min(0),
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -589,23 +595,30 @@ fn workspace(t: &mut Term, color: ThemeColor, root: &Path, names: &[String]) -> 
                 Paragraph::new(lines).block(Block::bordered().title("工作区")),
                 tree,
             );
-            hit = action;
-            let label = Paragraph::new("打开工作目录").centered();
-            f.render_widget(
-                if button {
-                    label.style(color.highlight())
-                } else {
-                    label
-                },
-                action,
-            );
-            f.render_widget(Paragraph::new(error.as_str()), status);
+            let buttons = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(bar);
+            for (i, (label, rect)) in ["打开工作目录", "保存工作", "提交工作"]
+                .iter()
+                .zip(buttons.iter())
+                .enumerate()
+            {
+                let item = Paragraph::new(*label).centered();
+                f.render_widget(
+                    if focus == i + 1 {
+                        item.style(color.highlight())
+                    } else {
+                        item
+                    },
+                    *rect,
+                );
+                hits.push(*rect);
+            }
+            f.render_widget(Paragraph::new(status.as_str()), message);
         })?;
         let activate = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Tab => {
-                    button = !button;
+                    focus = (focus + 1) % 4;
                     false
                 }
                 KeyCode::Up => {
@@ -616,28 +629,124 @@ fn workspace(t: &mut Term, color: ThemeColor, root: &Path, names: &[String]) -> 
                     offset = offset.saturating_add(1);
                     false
                 }
-                KeyCode::Enter => button,
+                KeyCode::Enter => focus > 0,
                 _ => false,
             },
-            Event::Mouse(m)
-                if m.kind == MouseEventKind::Down(MouseButton::Left)
-                    && hit.contains(Position::new(m.column, m.row)) =>
-            {
-                button = true;
-                true
+            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(i) = hits
+                    .iter()
+                    .position(|r| r.contains(Position::new(m.column, m.row)))
+                {
+                    focus = i + 1;
+                    true
+                } else {
+                    false
+                }
             }
             _ => false,
         };
-        if activate {
+        if !activate {
+            continue;
+        }
+        if focus == 1 {
             let utility = if cfg!(target_os = "macos") {
                 "open"
             } else {
                 "xdg-open"
             };
             match std::process::Command::new(utility).arg(root).output() {
-                Ok(out) if out.status.success() => error.clear(),
-                Ok(out) => error = String::from_utf8_lossy(&out.stderr).into_owned(),
-                Err(e) => error = e.to_string(),
+                Ok(out) if out.status.success() => status.clear(),
+                Ok(out) => status = String::from_utf8_lossy(&out.stderr).into_owned(),
+                Err(e) => status = e.to_string(),
+            }
+            continue;
+        }
+        let Reply::Team(Some(profile)) = client.request(Request::Profile)? else {
+            return Err(io::Error::other("Missing profile"));
+        };
+        let spaces = profile.team.spaces();
+        let Some(selection) = choose(t, color, "选择子工作区", &spaces, &[], false)? else {
+            continue;
+        };
+        let Some(space) = selection.first() else {
+            continue;
+        };
+        let mut action = if focus == 2 {
+            WorkAction::Save
+        } else {
+            WorkAction::Submit
+        };
+        loop {
+            let request = Request::WorkspaceAction {
+                space: space.clone(),
+                action: action.clone(),
+            };
+            let response = if matches!(action, WorkAction::ResolveOnTerminal(_)) {
+                execute!(
+                    io::stdout(),
+                    DisableMouseCapture,
+                    LeaveAlternateScreen,
+                    crossterm::cursor::Show
+                )?;
+                terminal::disable_raw_mode()?;
+                let response = client.request(request);
+                terminal::enable_raw_mode()?;
+                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+                t.clear()?;
+                response
+            } else {
+                client.request(request)
+            };
+            match response {
+                Ok(Reply::Work(WorkResult::Dirty)) => {
+                    if matches!(
+                        Form::new("工作区有未保存的修改", vec![], &["取消", "保存并提交"])
+                            .interact(t, color, "")?,
+                        Action::Button(1)
+                    ) {
+                        action = WorkAction::SaveAndSubmit
+                    } else {
+                        break;
+                    }
+                }
+                Ok(Reply::Work(WorkResult::Conflict)) => {
+                    action = if matches!(
+                        Form::new("文件存在合并冲突", vec![], &["推迟提交", "解决冲突"])
+                            .interact(t, color, "")?,
+                        Action::Button(1)
+                    ) {
+                        let tty = std::process::Command::new("tty")
+                            .stdin(std::process::Stdio::inherit())
+                            .output()?;
+                        if !tty.status.success() {
+                            status = "无法连接当前终端".into();
+                            break;
+                        }
+                        WorkAction::ResolveOnTerminal(
+                            String::from_utf8(tty.stdout)
+                                .map_err(io::Error::other)?
+                                .trim()
+                                .to_owned(),
+                        )
+                    } else {
+                        WorkAction::Defer
+                    }
+                }
+                Ok(Reply::Work(result)) => {
+                    status = match result {
+                        WorkResult::Saved => "已保存到个人分支",
+                        WorkResult::Published => "已提交到 main",
+                        WorkResult::Deferred => "已取消本次提交",
+                        _ => unreachable!(),
+                    }
+                    .into();
+                    break;
+                }
+                Err(e) => {
+                    status = e.to_string();
+                    break;
+                }
+                _ => return Err(io::Error::other("Missing workspace acknowledgement")),
             }
         }
     }

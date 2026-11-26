@@ -137,6 +137,12 @@ impl NewTeam {
             .iter()
             .any(|m| matches!(m.kind, MemberKind::Assistant) && m.actor_id == id)
     }
+    pub fn spaces(&self) -> Vec<(&str, &str)> {
+        self.spaces
+            .iter()
+            .map(|s| (s.space_id.as_str(), s.display_name.as_str()))
+            .collect()
+    }
     pub fn roster(&self) -> Vec<(&str, &str)> {
         self.members
             .iter()

@@ -162,3 +162,87 @@ fn sends_and_replies_with_frozen_attachments_and_independent_references() -> io:
     );
     fs::remove_dir_all(root)
 }
+
+#[test]
+fn workspace_save_submit_and_defer_preserve_branch_boundaries() -> io::Result<()> {
+    use synod::session::protocol::{WorkAction as A, WorkResult as R};
+    let root = std::env::temp_dir().join(format!("synod-work-{}", std::process::id()));
+    fs::create_dir(&root)?;
+    let bare = root.join("team.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .output()?
+            .status
+            .success()
+    );
+    let remote = bare.to_str().expect("fixture path");
+    let team: NewTeam = serde_json::from_str(include_str!("fixtures/v1/team/team.json"))?;
+    operations::publish_initial(
+        &root,
+        remote,
+        &team,
+        &operations::freeze_initial("member-alice")?,
+    )?;
+    let work = root.join("work");
+    fs::create_dir_all(work.join("code"))?;
+    let local = work.join("code/result");
+    fs::write(&local, "first")?;
+    let action =
+        |actor, a| operations::workspace_action(&root, &work, &team, remote, actor, "code", a);
+    assert_eq!(action("member-alice", A::Submit)?, R::Dirty);
+    assert_eq!(action("member-alice", A::Save)?, R::Saved);
+    let show = |spec: &str| {
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["show", spec])
+            .output()
+    };
+    assert!(!show("main:workspace/code/result")?.status.success());
+    assert_eq!(
+        show("work/member-alice/code:workspace/code/result")?.stdout,
+        b"first"
+    );
+    assert_eq!(action("member-alice", A::Submit)?, R::Published);
+    fs::write(&local, "bob")?;
+    assert_eq!(action("member-bob", A::SaveAndSubmit)?, R::Published);
+    fs::write(&local, "alice")?;
+    assert_eq!(action("member-alice", A::SaveAndSubmit)?, R::Conflict);
+    assert_eq!(action("member-alice", A::Defer)?, R::Deferred);
+    assert_eq!(fs::read(&local)?, b"alice");
+    assert_eq!(show("main:workspace/code/result")?.stdout, b"bob");
+    assert_eq!(
+        show("work/member-alice/code:workspace/code/result")?.stdout,
+        b"alice"
+    );
+    assert_eq!(action("member-alice", A::Submit)?, R::Conflict);
+    let marker = root
+        .join("teams")
+        .join(team.id())
+        .join("spaces/code/member-alice/merge-attempt");
+    let dir = root
+        .join("teams")
+        .join(team.id())
+        .join("worktrees")
+        .join(fs::read_to_string(marker)?);
+    for (key, value) in [
+        ("merge.tool", "fixture"),
+        ("mergetool.fixture.cmd", "cp \"$REMOTE\" \"$MERGED\""),
+        ("mergetool.fixture.trustExitCode", "true"),
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["config", key, value])
+                .output()?
+                .status
+                .success()
+        );
+    }
+    assert_eq!(action("member-alice", A::Resolve)?, R::Published);
+    assert_eq!(show("main:workspace/code/result")?.stdout, b"alice");
+    fs::remove_dir_all(root)
+}

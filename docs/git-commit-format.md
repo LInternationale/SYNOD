@@ -29,6 +29,7 @@ event_kind = "MarkedCompleted"
 | `draft.saved` | `letter_id`、`copy_id` | 作者对应的草稿引用。差异限于本信的信封、正文、附件。 |
 | `letter.sent` | `letter_id`、`event_id` | `main`，增加指定的封存原件和一个 `LetterSent` 事件。第一父是刚校验的主线，第二父是所寄的草稿版本。 |
 | `letter.event` | `letter_id`、`event_id`、`event_kind` | `main`，只新增对应事件文件。进度、完成、增减依赖使用各自的事件类别，载荷保存在事件 JSON 中。 |
+| `workspace.saved` | `space_id` | 个人分支 `work/<actor-id>/<space-id>`，保存所选子工作区。 |
 | `workspace.published` | `space_id` | `main`，新增、编辑或删除的路径均在该子空间内。 |
 
 Git 消息描述一次仓库操作。事件 JSON 记录信件的业务事实。发布和读取时核对消息所指的队伍、目标和实际文件变化。涉及事件时，信件编号、事件编号、类别、操作者和操作时间也须与事件一致。重放公告板按主线第一父顺序读取已验证事件。操作时间用于显示，Git SHA 用于定位某次实际提交。

@@ -239,6 +239,18 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
             }
             Ok(Reply::Drafts(drafts))
         }
+        Request::WorkspaceAction { space, action } => {
+            let profile = current.ok_or_else(|| io::Error::other("Team required"))?;
+            Ok(Reply::Work(operations::workspace_action(
+                &roots.state,
+                &roots.work,
+                &profile.team,
+                &profile.remote,
+                &profile.human,
+                &space,
+                action,
+            )?))
+        }
         Request::Workspace => {
             let mut names = Vec::new();
             fn visit(root: &Path, dir: &Path, names: &mut Vec<String>) -> io::Result<()> {

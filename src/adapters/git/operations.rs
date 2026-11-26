@@ -494,3 +494,260 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     }
     Err(io::Error::other("Remote branch advanced; retry this send"))
 }
+
+fn copy_workspace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::fs;
+    if !fs::symlink_metadata(from)?.is_dir() {
+        return Err(io::Error::other("Select an ordinary workspace directory"));
+    }
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().eq_ignore_ascii_case(".git") {
+            return Err(io::Error::other("Nested Git metadata in workspace"));
+        }
+        let target = to.join(name);
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_workspace(&entry.path(), &target)?
+        } else if ty.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else {
+            return Err(io::Error::other(
+                "Workspace contains a symbolic link or special file",
+            ));
+        }
+    }
+    Ok(())
+}
+fn work_msg(kind: &str, team: &str, actor: &str, space: &str) -> io::Result<String> {
+    let timestamp = freeze_initial(actor)?.timestamp;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let msg = format!(
+        "kind = \"{kind}\"\n\nschema_version = 1\nteam_id = \"{team}\"\noperation_id = \"work-{unique}-{}\"\nactor_id = \"{actor}\"\noccurred_at = {timestamp}\n\n[target]\nspace_id = \"{space}\"\n",
+        std::process::id()
+    );
+    super::commit_message::decode(&msg).map_err(|e| io::Error::other(format!("{e:?}")))?;
+    Ok(msg)
+}
+fn check_staged_scope(dir: &Path, space: &str) -> io::Result<()> {
+    let diff = git(
+        dir,
+        &[
+            "diff",
+            "--cached",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "HEAD",
+        ],
+    )?;
+    let prefix = format!("workspace/{space}/");
+    if !diff
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .all(|p| p.starts_with(prefix.as_bytes()))
+    {
+        return Err(io::Error::other(
+            "Candidate changes outside selected workspace",
+        ));
+    }
+    Ok(())
+}
+
+pub fn workspace_action(
+    state: &Path,
+    work: &Path,
+    team: &NewTeam,
+    remote: &str,
+    actor: &str,
+    space: &str,
+    action: crate::session::protocol::WorkAction,
+) -> io::Result<crate::session::protocol::WorkResult> {
+    use crate::session::protocol::{WorkAction as A, WorkResult as R};
+    use std::fs;
+    team.validate()?;
+    if !team.human(actor) || !team.spaces().iter().any(|(id, _)| *id == space) {
+        return Err(io::Error::other(
+            "Select a human identity and a team workspace",
+        ));
+    }
+    let base = state.join("teams").join(team.id());
+    let area = base.join("spaces").join(space).join(actor);
+    fs::create_dir_all(&area)?;
+    let marker = area.join("merge-attempt");
+    let prefix = format!("workspace/{space}");
+    let personal = format!("refs/heads/work/{actor}/{space}");
+    let attempts = base.join("worktrees");
+    let publish = |dir: &Path| -> io::Result<R> {
+        check_staged_scope(dir, space)?;
+        if !git(dir, &["ls-files", "-u", "-z"])?.is_empty() {
+            return Ok(R::Conflict);
+        }
+        commit(
+            dir,
+            &work_msg("workspace.published", team.id(), actor, space)?,
+        )?;
+        git(dir, &["push", "--", remote, "HEAD:refs/heads/main"])?;
+        Ok(R::Published)
+    };
+    if matches!(action, A::Defer) {
+        if marker.exists() {
+            fs::remove_file(marker)?
+        }
+        return Ok(R::Deferred);
+    }
+    if matches!(action, A::Resolve | A::ResolveOnTerminal(_)) {
+        let attempt = fs::read_to_string(&marker)?;
+        if !attempt.starts_with("work-")
+            || !attempt
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b"work-".contains(&b))
+        {
+            return Err(io::Error::other("Invalid merge attempt"));
+        }
+        let dir = attempts.join(attempt);
+        if git(&dir, &["config", "--get", "merge.tool"]).is_err() {
+            return Err(io::Error::other(
+                "Configure Git merge.tool before resolving conflicts",
+            ));
+        }
+        if let A::ResolveOnTerminal(path) = action {
+            #[cfg(unix)]
+            {
+                use std::{io::IsTerminal, os::unix::fs::MetadataExt};
+                let path = Path::new(&path).canonicalize()?;
+                if !path.starts_with("/dev")
+                    || fs::metadata(&path)?.uid() != fs::metadata(&marker)?.uid()
+                {
+                    return Err(io::Error::other("Invalid terminal device"));
+                }
+                let tty = fs::OpenOptions::new().read(true).write(true).open(path)?;
+                if !tty.is_terminal() {
+                    return Err(io::Error::other("Expected a terminal device"));
+                }
+                let status = Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(["mergetool", "--no-prompt", "--", &prefix])
+                    .stdin(tty.try_clone()?)
+                    .stdout(tty.try_clone()?)
+                    .stderr(tty)
+                    .status()?;
+                if !status.success() {
+                    return Err(io::Error::other(
+                        "Merge tool exited without resolving the conflict",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            return Err(io::Error::other("Terminal handoff unavailable"));
+        } else {
+            git(&dir, &["mergetool", "--no-prompt", "--", &prefix])?;
+        }
+        let result = publish(&dir)?;
+        if result == R::Published {
+            fs::remove_file(marker)?
+        }
+        return Ok(result);
+    }
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let attempt = format!("work-{unique}-{}", std::process::id());
+    let dir = attempts.join(&attempt);
+    fs::create_dir_all(&dir)?;
+    git(&dir, &["init"])?;
+    git(&dir, &["config", "user.name", actor])?;
+    git(&dir, &["config", "user.email", "synod@localhost"])?;
+    git(
+        &dir,
+        &[
+            "fetch",
+            "--no-tags",
+            "--",
+            remote,
+            "refs/heads/main:refs/heads/published",
+        ],
+    )?;
+    let manifest: NewTeam = serde_json::from_slice(&git(&dir, &["show", "published:team.json"])?)?;
+    manifest.validate()?;
+    if manifest.id() != team.id() {
+        return Err(io::Error::other("Remote team does not match this client"));
+    }
+    let has_personal = !git(&dir, &["ls-remote", "--", remote, &personal])?.is_empty();
+    if has_personal {
+        git(
+            &dir,
+            &[
+                "fetch",
+                "--no-tags",
+                "--",
+                remote,
+                &format!("{personal}:refs/heads/personal"),
+            ],
+        )?;
+    }
+    git(
+        &dir,
+        &[
+            "switch",
+            "--detach",
+            if has_personal {
+                "personal"
+            } else {
+                "published"
+            },
+        ],
+    )?;
+    let sub = dir.join(&prefix);
+    let parent = dir.join("workspace");
+    if parent.exists() && !fs::symlink_metadata(&parent)?.is_dir() {
+        return Err(io::Error::other("Invalid remote workspace root"));
+    }
+    if let Ok(meta) = fs::symlink_metadata(&sub) {
+        if !meta.is_dir() {
+            return Err(io::Error::other("Invalid remote subworkspace"));
+        }
+        fs::remove_dir_all(&sub)?;
+    }
+    copy_workspace(&work.join(space), &sub)?;
+    if !git(&dir, &["ls-files", "-z", "--", &prefix])?.is_empty()
+        || fs::read_dir(&sub)?.next().is_some()
+    {
+        git(&dir, &["add", "--all", "--force", "--", &prefix])?;
+    }
+    check_staged_scope(&dir, space)?;
+    let dirty = !git(&dir, &["diff", "--cached", "--name-only", "-z", "HEAD"])?.is_empty();
+    if matches!(action, A::Submit) && (dirty || !has_personal) {
+        return Ok(R::Dirty);
+    }
+    if dirty {
+        commit(&dir, &work_msg("workspace.saved", team.id(), actor, space)?)?;
+        git(&dir, &["push", "--", remote, &format!("HEAD:{personal}")])?;
+    } else if !has_personal && matches!(action, A::Save | A::SaveAndSubmit) {
+        git(&dir, &["push", "--", remote, &format!("HEAD:{personal}")])?;
+    }
+    if matches!(action, A::Save) {
+        return Ok(R::Saved);
+    }
+    let oid = git(&dir, &["rev-parse", "HEAD"])?;
+    let oid = std::str::from_utf8(&oid).map_err(io::Error::other)?.trim();
+    git(&dir, &["switch", "--detach", "published"])?;
+    if !git(&dir, &["branch", "--contains", oid, "--list", "published"])?.is_empty() {
+        return Ok(R::Published);
+    }
+    match git(&dir, &["merge", "--no-ff", "--no-commit", oid]) {
+        Ok(_) => publish(&dir),
+        Err(_) if !git(&dir, &["ls-files", "-u", "-z"])?.is_empty() => {
+            fs::write(marker, attempt)?;
+            Ok(R::Conflict)
+        }
+        Err(e) => Err(e),
+    }
+}
