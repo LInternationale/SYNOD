@@ -206,20 +206,18 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
     let roots = match bootstrap::configured(file)? {
         Some(r) => r,
         None => {
-            let mut form = Form::new(
-                "首次设置",
-                vec![field("本机状态目录", ""), field("队伍工作目录", "")],
-                &["继续"],
-            );
-            let mut msg = String::new();
+            let mut setup = super::directory_setup::DirectorySetup::default();
             loop {
-                if matches!(form.interact(t, initial, &msg)?, Action::Back) {
-                    return Ok(());
-                }
-                match bootstrap::initialize(file, Path::new(&form.val(0)), Path::new(&form.val(1)))
-                {
-                    Ok(r) => break r,
-                    Err(e) => msg = e.to_string(),
+                let area = t.draw(|frame| setup.render(frame, initial))?.area;
+                match setup.handle(input()?, area, super::native_file::directory) {
+                    super::directory_setup::Action::Stay => {}
+                    super::directory_setup::Action::Exit => return Ok(()),
+                    super::directory_setup::Action::Finish(state, work) => {
+                        match bootstrap::initialize(file, state, work) {
+                            Ok(roots) => break roots,
+                            Err(e) => setup.status = e.to_string(),
+                        }
+                    }
                 }
             }
         }

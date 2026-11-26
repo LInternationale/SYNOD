@@ -122,3 +122,6 @@ pub mod preferences;
 pub mod live;
 #[cfg(unix)]
 mod native_file;
+
+#[cfg(unix)]
+mod directory_setup;

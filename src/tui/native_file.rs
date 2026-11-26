@@ -1,15 +1,31 @@
 //! Native desktop attachment selection. Cancellation leaves the draft unchanged.
 use crate::session::protocol::Attachment;
-use std::{fs, io, path::Path, process::Command};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 pub fn select() -> io::Result<Option<Attachment>> {
+    pick(false)?.map(|path| read_attachment(&path)).transpose()
+}
+
+pub(super) fn directory() -> io::Result<Option<PathBuf>> {
+    pick(true)
+}
+
+fn pick(folder: bool) -> io::Result<Option<PathBuf>> {
     #[cfg(target_os = "macos")]
     let result = Command::new("osascript")
         .args([
             "-e",
             "try",
             "-e",
-            "return POSIX path of (choose file)",
+            if folder {
+                "return POSIX path of (choose folder)"
+            } else {
+                "return POSIX path of (choose file)"
+            },
             "-e",
             "on error number -128",
             "-e",
@@ -19,9 +35,16 @@ pub fn select() -> io::Result<Option<Attachment>> {
         ])
         .output()?;
     #[cfg(not(target_os = "macos"))]
-    let result = Command::new("zenity")
-        .args(["--file-selection", "--title=添加附件"])
-        .output()?;
+    let result = {
+        let mut command = Command::new("zenity");
+        command.arg("--file-selection");
+        if folder {
+            command.args(["--directory", "--title=选择文件夹"]);
+        } else {
+            command.arg("--title=添加附件");
+        }
+        command.output()?
+    };
     #[cfg(not(target_os = "macos"))]
     if result.status.code() == Some(1) {
         return Ok(None);
@@ -38,7 +61,7 @@ pub fn select() -> io::Result<Option<Attachment>> {
     if path.is_empty() {
         return Ok(None);
     }
-    read_attachment(Path::new(&path)).map(Some)
+    Ok(Some(PathBuf::from(path)))
 }
 
 fn read_attachment(path: &Path) -> io::Result<Attachment> {
