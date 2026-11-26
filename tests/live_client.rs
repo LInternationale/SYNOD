@@ -70,7 +70,11 @@ fn isolated_terminal() {
         let profile = Profile {
             team,
             human: "member-alice".into(),
-            assistant: String::new(),
+            assistant: if std::env::var_os("SYNOD_TEST_MCP").is_some() {
+                "assistant-alice".into()
+            } else {
+                String::new()
+            },
             remote: remote.into(),
         };
         c.fields.insert(
@@ -86,7 +90,11 @@ fn isolated_terminal() {
         assert!(std::time::Instant::now() < until);
         std::thread::yield_now();
     }
-    synod::tui::live::run(&config).expect("terminal");
+    if std::env::var_os("SYNOD_TEST_MCP").is_some() {
+        synod::mcp::run(&config).expect("MCP");
+    } else {
+        synod::tui::live::run(&config).expect("terminal");
+    }
     host.join().expect("host thread").expect("host");
 }
 
@@ -116,7 +124,7 @@ fn sends_and_replies_with_frozen_attachments_and_independent_references() -> io:
         title: "Diagram".into(),
         to: "member-chen".into(),
         cc: "member-bob,assistant-chen".into(),
-        body: "Deliver figure".into(),
+        body: "Deliver figure\n- [ ] verify".into(),
         attachments: vec![Attachment {
             filename: "图.png".into(),
             bytes: vec![0, 255],
@@ -162,6 +170,104 @@ fn sends_and_replies_with_frozen_attachments_and_independent_references() -> io:
         read(format!("letters/{}/attachments/asset-1", original.id))?.stdout,
         vec![0, 255]
     );
+    use synod::application::letters::TaskChange;
+    let task = |id: &str, operation: &str, change: TaskChange| {
+        operations::change_task(
+            &root,
+            &team,
+            remote,
+            id,
+            &operations::InitialCommit {
+                actor: "member-chen".into(),
+                timestamp: "2026-11-26T09:00:00Z".into(),
+                operation: operation.into(),
+            },
+            &change,
+        )
+    };
+    task(
+        &original.id,
+        "link",
+        TaskChange::Subtasks {
+            selected: vec![replied.id.clone()],
+            observed: vec![],
+        },
+    )?;
+    assert!(
+        task(
+            &replied.id,
+            "cycle",
+            TaskChange::Subtasks {
+                selected: vec![original.id.clone()],
+                observed: vec![]
+            }
+        )
+        .is_err()
+    );
+    task(&replied.id, "done", TaskChange::Completion(true))?;
+    task(&replied.id, "done", TaskChange::Completion(true))?;
+    task(&replied.id, "also-done", TaskChange::Completion(true))?;
+    let updated = operations::published_letters(&root, &team, remote)?;
+    assert_eq!(
+        updated
+            .iter()
+            .find(|l| l.id == original.id)
+            .unwrap()
+            .progress,
+        33
+    );
+    assert_eq!(
+        updated
+            .iter()
+            .find(|l| l.id == replied.id)
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
+    task(&replied.id, "reopen", TaskChange::Completion(false))?;
+    assert_eq!(
+        operations::published_letters(&root, &team, remote)?
+            .iter()
+            .find(|l| l.id == original.id)
+            .unwrap()
+            .progress,
+        0
+    );
+    use synod::application::letters::ChecklistChange;
+    for checked in [true, false] {
+        task(
+            &original.id,
+            if checked { "tick" } else { "untick" },
+            TaskChange::Checklist(ChecklistChange { line: 1, checked }),
+        )?;
+        let clean = root.join(if checked {
+            "fresh-checked"
+        } else {
+            "fresh-unchecked"
+        });
+        let projected = operations::published_letters(&clean, &team, remote)?;
+        let letter = projected.iter().find(|l| l.id == original.id).unwrap();
+        assert_eq!(letter.checklist[0].checked, checked);
+        assert_eq!(letter.progress_done, usize::from(checked));
+        assert_eq!(letter.body, "Deliver figure\n- [ ] verify");
+        let event_dir = format!("letters/{}/events", original.id);
+        for (args, expected) in [
+            (vec!["diff", "--name-only", "main^", "main"], ""),
+            (
+                vec!["ls-tree", "-r", "--name-only", "main", "--", &event_dir],
+                "",
+            ),
+        ] {
+            let output = Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .args(args)
+                .output()?;
+            assert!(output.status.success());
+            assert_eq!(output.stdout, expected.as_bytes());
+        }
+    }
     fs::remove_dir_all(root)
 }
 

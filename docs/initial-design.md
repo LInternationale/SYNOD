@@ -1,5 +1,8 @@
 # SYNOD 初始设计蓝图
 
+当前队伍 Git 协议为 v2. 操作信息写进 commit message，文件版本由 Git 保存. 下文涉及事件文件的约定仅用于读取 v1 仓库. 正文待办和子任务按当前进度规则汇总. [当前 Git 协议](git-commit-format.md) · [进度规则](implementation.md#inline-checklist-revision-and-independent-review)
+
+
 版本 0.3 · 2026-11-26 · 目录、提交协议与统一会话已完成独立设计评审，应用处于设计阶段
 
 ## 一场比赛里的六个成员

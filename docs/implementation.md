@@ -171,3 +171,29 @@ Independent review: local serial references cannot identify letters across devic
 Use #9AB0C2 for the default, with dark foreground on light selected backgrounds. Existing configurations serialized the old default even when the user never edited it. Migrate that exact legacy value on read; preserve other custom colors and record explicit future choices so users can still choose the older RGB. Verify first-run and legacy settings, explicit override and rendered focus text.
 
 Cloud and theme comparison: the local Git integration test used two state roots and a bare remote. It saved, rediscovered attachments, edited concurrently, retried the deterministic conflict copy and sent that copy, while the other unsent version remained discoverable. Local settings tests exercised the new default, legacy migration and an explicit old-color override. Offline tests passed; nightly overall branch coverage was 42.69%. Sync retries currently run when revisiting drafts; an autonomous session synchronization loop remains pending.
+
+## Published history replay and completion
+
+Read main by first-parent order. Decode each complete v1 commit message, constrain paths and parents to its operation, and check event JSON against stable identity, actor, timestamp, target and append-only status. A letter.sent merge must introduce the corresponding sealed original and event; verify against its draft parent. Build received/CC, original references and signed events into the letter view. A MarkedCompleted command freezes a stable operation, fetches current main and attempts a fast-forward update of one new event. If a teammate already completed it, return that event without adding another. Verify the result by fetching remote state after push. Test actual Git history including fixture versions and rejection of malformed events. Keep detail-page interaction separate until confirmed.
+
+## Revised task model
+
+Each letter has one manually submitted completion flag. Space stages the checkbox and Enter submits it; selecting subtasks in a separate progress window defines the dependent letters. Aggregate progress is derived independently from the task graph. Never submit a manual numeric progress report. Read old reports as historical facts. Store an entire subtask selection as one signed event with the observed previous selection to prevent partial application and lost edits. Retain references as unrelated reply links. Check cycle formation on refreshed main before every push.
+
+## Progress arithmetic approved by the user
+
+For a parent, count itself and every distinct transitive subtask exactly once. A checked node covers itself and every descendant, without writing their manual flags. Traverse uncovered and covered paths independently so a shared descendant reached through a checked branch counts as complete regardless of visit order. Unchecking reverses that coverage. Validate the graph is acyclic and all children exist before projecting it. Render a bar only when the letter has subtasks, showing completed count and total. Verify the six-node example, shared children, overlapping checked subtrees, and unchecking.
+
+## Assistant session and read markers
+
+The approved rmcp server uses stdio and a single IPC connection bound to the assistant slot in its handshake. Tools delegate to the existing session requests; no client-supplied actor may override attribution. The human and AI retain independent per-device read receipts keyed by team, actor and LetterSent identity. A recipient or CC sees a marker until opening the letter; merely listing or synchronizing does not consume it. MCP reads a letter explicitly to acknowledge it. Keep protocol stdout clean. Test a real stdio handshake and call against an isolated session, checking the saved actor and both read markers.
+
+## Inline checklist revision and independent review
+
+Identify checklist items by their zero-based line in the immutable sent body. Parse dash checkboxes outside fenced examples. Each contributes one unit, including checked items. Replay a ChecklistSet event by line and desired boolean, rejecting missing lines. A checked ancestor covers the letter and its items. Deduplicate at letter level before summing. Show a meter for checklist-only letters. The detail view exposes individual items for Space staging and Enter submission.
+
+Review found duplicate item text cannot identify a task and raw marker replacement would change sealed content. Line identity and a separately projected checkbox resolve both issues. Verify duplicate labels, fenced examples, shared descendants, manual coverage and state reversal.
+
+## Git-only history implementation review
+
+The v2 format in git-commit-format.md supersedes earlier event-file designs. Operations writes signed-by-identity metadata in the Git message. The history reader checks first-parent diffs, original blobs against the draft parent, and metadata before projection. V1 is read through the original event-file contract. The live-client test sent and retried a letter, toggled a body checkbox, verified unchanged Git trees for both transitions, and reconstructed each state under an empty client root. The historical fixture and DAG progress tests passed. A real stdio MCP session sent a letter as the assistant, read its unread marker and submitted completion. A PTY session selected the inline checkbox by arrow, staged with Space and submitted with Enter; the remote tip contained ChecklistSet. Cargo tests passed; nightly overall branch coverage was 41.60%, excluding the separate process smoke checks. Background synchronization and Windows transport remain separate open work.

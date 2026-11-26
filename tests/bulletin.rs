@@ -44,8 +44,9 @@ fn draft_precedes_publication_and_buttons_share_actions() -> Result<(), std::con
     );
     for (x, expected) in [
         (10, BoardAction::Compose),
-        (30, BoardAction::Preferences),
-        (50, BoardAction::Workspace),
+        (20, BoardAction::Preferences),
+        (36, BoardAction::Workspace),
+        (52, BoardAction::Filter),
     ] {
         board.handle(key(KeyCode::Tab), area, &rows);
         terminal.draw(|f| board.render(f, &rows))?;
@@ -86,7 +87,7 @@ fn quick_reply_targets_the_selected_published_letter() {
     let rows = BoardRows::new(&[], &letters);
     let mut board = Bulletin::default();
     let area = Rect::new(0, 0, 60, 8);
-    for _ in 0..4 {
+    for _ in 0..5 {
         board.handle(Event::Key(KeyCode::Tab.into()), area, &rows);
     }
     assert_eq!(
@@ -112,7 +113,7 @@ fn arrows_reach_actions_from_both_ends_of_the_list() {
         (KeyCode::Left, BoardAction::Compose),
         (KeyCode::Right, BoardAction::Preferences),
         (KeyCode::Right, BoardAction::Workspace),
-        (KeyCode::Right, BoardAction::Workspace),
+        (KeyCode::Right, BoardAction::Filter),
     ] {
         board.handle(Event::Key(direction.into()), area, &rows);
         assert_eq!(

@@ -39,16 +39,21 @@ target!(SentTarget {
     letter_id,
     event_id
 });
-target!(EventTarget {
-    letter_id,
-    event_id,
-    event_kind
-});
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventTarget {
+    pub letter_id: String,
+    pub event_id: String,
+    pub event_kind: String,
+    pub subtasks: Option<Vec<String>>,
+    pub checklist_change: Option<crate::application::letters::ChecklistChange>,
+}
 target!(SpaceTarget { space_id });
 
 /// Decoded metadata. The Git adapter verifies it against the actual tree and parents.
 #[derive(Debug)]
 pub struct TeamCommit {
+    pub version: u32,
     pub team_id: String,
     pub operation_id: String,
     pub actor_id: String,
@@ -78,7 +83,7 @@ pub fn decode(message: &str) -> Result<TeamCommit, DecodeError> {
         return Err(DecodeError::LineEnding);
     }
     let data: Metadata = toml::from_str(message).map_err(DecodeError::Toml)?;
-    if data.schema_version != 1 {
+    if !matches!(data.schema_version, 1 | 2) {
         return Err(DecodeError::Version(data.schema_version));
     }
     if data.occurred_at.offset.is_none() {
@@ -109,6 +114,7 @@ pub fn decode(message: &str) -> Result<TeamCommit, DecodeError> {
         _ => return Err(DecodeError::UnknownKind(data.kind)),
     };
     Ok(TeamCommit {
+        version: data.schema_version,
         team_id: data.team_id,
         actor_id: data.actor_id,
         operation_id: data.operation_id,

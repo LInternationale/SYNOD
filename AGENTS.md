@@ -68,6 +68,10 @@ This section is **design guidance, not mandatory engineering discipline**. Consi
 - Keep adapters focused on boundary integration and translation. Avoid turning one adapter into a collection of HTTP transport, caching policy, projection, and aggregation responsibilities. Assign these responsibilities explicitly in the blueprint: transport to the integration layer that owns it, business projection/aggregation to the relevant domain logic, and caching to a focused component where appropriate.
 - Aim to keep each crate understandable from its own blueprint and public contracts, reducing the amount of cross-crate implementation context needed by both humans and agents.
 
+## Team history
+
+Git is the sole version history of team data. Put the operation metadata in the team commit message and let Git retain historical file versions. Do not maintain a parallel event-file archive, revision database, or application-managed snapshots. Local pending work and rebuildable views serve recovery and presentation only. Preserve read compatibility with older team repositories.
+
 ## Workflow & Engineering Rules
 
 - **Before implementing changes**:

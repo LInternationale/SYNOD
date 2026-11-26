@@ -22,6 +22,8 @@ pub enum BoardAction<'a> {
     Workspace,
     OpenDraft(&'a str),
     QuickReply(String),
+    Read(String),
+    Filter,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -31,6 +33,7 @@ enum Focus {
     Compose,
     Preferences,
     Workspace,
+    Filter,
     Reply,
 }
 
@@ -41,6 +44,7 @@ impl Focus {
             Self::Compose,
             Self::Preferences,
             Self::Workspace,
+            Self::Filter,
             Self::Reply,
         ];
         let index = order.iter().position(|v| *v == self)?;
@@ -57,6 +61,7 @@ impl Focus {
 
     fn action(self, selected: Option<&str>) -> Option<BoardAction<'static>> {
         match self {
+            Self::Filter => Some(BoardAction::Filter),
             Self::Reply => selected.map(|id| BoardAction::QuickReply(id.to_owned())),
             Self::List => None,
             Self::Compose => Some(BoardAction::Compose),
@@ -66,15 +71,16 @@ impl Focus {
     }
 }
 
-const BUTTONS: [(Focus, &str); 4] = [
+const BUTTONS: [(Focus, &str); 5] = [
     (Focus::Compose, "写信"),
     (Focus::Preferences, "偏好"),
     (Focus::Workspace, "工作区"),
+    (Focus::Filter, "筛选"),
     (Focus::Reply, "快速回复"),
 ];
 
 fn layout(area: Rect, reply: bool) -> (Rect, std::rc::Rc<[Rect]>) {
-    let count = if reply { 4 } else { 3 };
+    let count = if reply { 5 } else { 4 };
     let [list, bar] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     (
         list,
@@ -124,6 +130,11 @@ pub struct Bulletin {
 }
 
 impl Bulletin {
+    pub fn return_to_list(&mut self) {
+        if let BoardScreen::Detail(id) = &self.screen {
+            self.screen = BoardScreen::Board(id.clone());
+        }
+    }
     fn selected_letter(&self) -> Option<&str> {
         match &self.screen {
             BoardScreen::Board(key) => key.strip_prefix("letter:"),
@@ -196,6 +207,12 @@ impl Bulletin {
                         }
                     }
                     self.screen.navigate(key.code, &views);
+                    if key.code == KeyCode::Enter
+                        && let BoardScreen::Detail(key) = &self.screen
+                        && let Some(id) = key.strip_prefix("letter:")
+                    {
+                        return Some(BoardAction::Read(id.into()));
+                    }
                 }
             }
             Event::Mouse(mouse)

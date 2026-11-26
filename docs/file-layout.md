@@ -1,5 +1,8 @@
 # 文件组织规范
 
+当前队伍 Git 协议为 v2. 操作信息写进 commit message，文件版本由 Git 保存. 下文涉及事件文件的约定仅用于读取 v1 仓库. 正文待办和子任务按当前进度规则汇总. [当前 Git 协议](git-commit-format.md) · [进度规则](implementation.md#inline-checklist-revision-and-independent-review)
+
+
 蓝图 0.3 · 已评审的目录约定 · 队伍文件格式 v1
 
 开发者在源码仓库里增加功能。客户端将已发布的协作数据写入队伍仓库，把身份、尚未送达的操作和恢复信息写入本机状态目录。队员实际编辑代码、论文的目录由每队在本机单独配置。下面的路径都相对于各自的根目录。

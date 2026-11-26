@@ -1,7 +1,7 @@
 //! Unix session ownership and JSON line transport.
 use super::{
     bootstrap,
-    protocol::{Reply, Request, VERSION},
+    protocol::{Entry, Reply, Request, VERSION},
 };
 use crate::adapters::local::state::ClientConfig;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -50,6 +50,9 @@ fn discover(root: &Path) -> io::Result<(UnixStream, String)> {
 pub struct Client(BufReader<UnixStream>);
 impl Client {
     pub fn connect(root: &Path) -> io::Result<Self> {
+        Self::connect_as(root, Entry::Human)
+    }
+    pub fn connect_as(root: &Path, entry: Entry) -> io::Result<Self> {
         let connect = || discover(root);
         let (stream, generation) = match connect() {
             Ok(s) => s,
@@ -77,7 +80,7 @@ impl Client {
             }
         };
         let mut client = Self(BufReader::new(stream));
-        match client.request(Request::Hello(VERSION, generation))? {
+        match client.request(Request::Hello(VERSION, generation, entry))? {
             Reply::Ready => Ok(client),
             _ => Err(io::Error::other("Incompatible session")),
         }
@@ -93,12 +96,15 @@ impl Client {
 
 fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
-    if !matches!(read(&mut reader)?, Request::Hello(VERSION,g) if g==generation) {
-        return write(
-            reader.get_mut(),
-            &Reply::Failure("Incompatible session".into()),
-        );
-    }
+    let entry = match read(&mut reader)? {
+        Request::Hello(VERSION, g, entry) if g == generation => entry,
+        _ => {
+            return write(
+                reader.get_mut(),
+                &Reply::Failure("Incompatible session".into()),
+            );
+        }
+    };
     write(reader.get_mut(), &Reply::Ready)?;
     loop {
         let request = read(&mut reader)?;
@@ -124,11 +130,13 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
                 | Request::Create { .. }
                 | Request::Identities { .. }
                 | Request::Send(_)
+                | Request::Task { .. }
+                | Request::Read(_)
                 | Request::Published
                 | Request::Drafts
                 | Request::SaveDraft(_)
                 | Request::WorkspaceAction { .. }
-                | Request::Workspace) => super::host::perform(&file, other),
+                | Request::Workspace) => super::host::perform_as(&file, other, entry),
                 Request::Hello(..) => Err(io::Error::other("Session already connected")),
             }
         })();

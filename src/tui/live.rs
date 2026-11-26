@@ -268,6 +268,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
     }
     let mut board = Bulletin::default();
     let mut published = Vec::new();
+    let mut filter = "all".to_string();
     loop {
         let Reply::Drafts(drafts) = client.request(Request::Drafts)? else {
             return Err(io::Error::other("Missing draft list"));
@@ -286,15 +287,33 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             }
             _ => return Err(io::Error::other("Missing publication list")),
         };
+        let actor = if filter == "all" {
+            String::new()
+        } else {
+            match client.request(Request::Profile)? {
+                Reply::Team(Some(p)) => p.human,
+                _ => String::new(),
+            }
+        };
+        let labels: std::collections::HashMap<_, _> = published
+            .iter()
+            .filter(|l| l.unread)
+            .map(|l| (&l.id, format!("【未读】{}", l.title)))
+            .collect();
         let views: Vec<_> = published
             .iter()
+            .filter(|l| match filter.as_str() {
+                "to_me" => !actor.is_empty() && l.to == actor,
+                "cc_me" => l.cc.contains(&actor),
+                _ => true,
+            })
             .map(|l| super::LetterView {
                 id: &l.id,
-                title: &l.title,
+                title: labels.get(&l.id).map_or(l.title.as_str(), String::as_str),
                 body: &l.body,
             })
             .collect();
-        let rows = BoardRows::new(&draft_views, &views);
+        let rows = BoardRows::new(if filter == "all" { &draft_views } else { &[] }, &views);
         let action = loop {
             let area = t.draw(|f| board.render_with_theme(f, &rows, color))?.area;
             let e = input()?;
@@ -303,6 +322,29 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             }
         };
         match action {
+            BoardAction::Read(id) => {
+                if let Reply::Letter(l) = client.request(Request::Read(id))? {
+                    task_detail(t, &mut client, color, &l, &published)?
+                }
+                board.return_to_list();
+            }
+            BoardAction::Filter => {
+                if let Some(choice) = choose(
+                    t,
+                    color,
+                    "筛选信件",
+                    &[
+                        ("all", "全部信件"),
+                        ("to_me", "发给我的"),
+                        ("cc_me", "抄送我的"),
+                    ],
+                    &[filter.clone()],
+                    false,
+                )? && let Some(value) = choice.first()
+                {
+                    filter = value.clone()
+                }
+            }
             BoardAction::Compose => compose(t, &mut client, color, Draft::default(), &published)?,
             BoardAction::QuickReply(id) => {
                 if let Some(letter) = published.iter().find(|l| l.id == id) {
@@ -580,7 +622,7 @@ fn compose(
             "收件人",
             "抄送",
             "引用",
-            "前置依赖",
+            "子任务",
             "添加附件",
             "存草稿",
             "寄信",
@@ -589,7 +631,7 @@ fn compose(
     let mut msg = String::new();
     loop {
         let summary = format!(
-            "收件人 {}  抄送 {}  引用 {}  前置依赖 {}  附件 {}\n{msg}",
+            "收件人 {}  抄送 {}  引用 {}  子任务 {}  附件 {}\n{msg}",
             editing.to,
             editing.cc,
             editing.references.len(),
@@ -638,8 +680,7 @@ fn compose(
                 }
             }
             Action::Button(3) => {
-                if let Some(v) = choose(t, c, "前置依赖", &letters, &editing.dependencies, true)?
-                {
+                if let Some(v) = choose(t, c, "子任务", &letters, &editing.dependencies, true)? {
                     editing.dependencies = v
                 }
             }
@@ -967,6 +1008,308 @@ fn choose(
             } else {
                 values.push(id.to_string())
             }
+        }
+    }
+}
+
+/// Inspect the signed original and stage the manual completion flag separately from progress.
+fn task_detail(
+    t: &mut Term,
+    client: &mut Client,
+    color: ThemeColor,
+    initial: &PublishedLetter,
+    board: &[PublishedLetter],
+) -> io::Result<()> {
+    use crate::application::letters::TaskChange;
+    let mut letter = initial.clone();
+    let mut staged = letter.completed;
+    let mut ticks: Vec<_> = letter.checklist.iter().map(|i| i.checked).collect();
+    let mut reveal = false;
+    let mut focus = 0usize;
+    let mut message = String::new();
+    let mut scroll = 0u16;
+    loop {
+        let check = if staged {
+            "☑ 任务完成"
+        } else {
+            "☐ 任务完成"
+        };
+        let mut bounds = Vec::new();
+        t.draw(|f| {
+            let outer = super::page(&letter.title, color);
+            let inner = outer.inner(f.area());
+            f.render_widget(outer, f.area());
+            let show_progress = !letter.dependencies.is_empty() || !letter.checklist.is_empty();
+            let [meter, body, bar, footer] = Layout::vertical([
+                Constraint::Length(u16::from(show_progress)),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(2),
+            ])
+            .areas(inner);
+            if show_progress {
+                f.render_widget(
+                    ratatui::widgets::Gauge::default()
+                        .gauge_style(color.highlight())
+                        .ratio(letter.progress_done as f64 / letter.progress_total as f64)
+                        .label(format!(
+                            "任务进度  {}/{}  ({}%)",
+                            letter.progress_done, letter.progress_total, letter.progress
+                        )),
+                    meter,
+                );
+            }
+            let mut text = format!(
+                "发件人  {}\n收件人  {}\n抄送  {}\n",
+                letter.author,
+                letter.to,
+                letter.cc.join("、")
+            );
+            let mut lines: Vec<ratatui::text::Line> =
+                text.split('\n').map(|s| s.to_owned().into()).collect();
+            let mut positions = Vec::new();
+            let mut next_item = letter.checklist.iter().enumerate().peekable();
+            for (line, raw) in letter.body.lines().enumerate() {
+                if let Some(&(i, item)) = next_item.peek()
+                    && item.line == line
+                {
+                    positions.push((i + 2, lines.len()));
+                    let style = if focus == i + 2 {
+                        color.highlight()
+                    } else {
+                        Default::default()
+                    };
+                    lines.push(ratatui::text::Line::styled(
+                        format!("{} {}", if ticks[i] { "☑" } else { "☐" }, item.label),
+                        style,
+                    ));
+                    next_item.next();
+                } else {
+                    lines.push(raw.to_owned().into());
+                }
+            }
+            text.clear();
+            if !letter.references.is_empty() {
+                text.push_str("\n\n引用");
+                for id in &letter.references {
+                    text.push_str("\n");
+                    text.push_str(
+                        board
+                            .iter()
+                            .find(|l| &l.id == id)
+                            .map_or(id.as_str(), |l| l.title.as_str()),
+                    );
+                }
+            }
+            for event in letter
+                .events
+                .iter()
+                .filter(|e| matches!(e.kind.as_str(), "MarkedCompleted" | "MarkedIncomplete"))
+            {
+                text.push_str(&format!(
+                    "\n{}  {}  {}",
+                    event.occurred_at,
+                    event.actor_id,
+                    if event.kind == "MarkedCompleted" {
+                        "标记完成"
+                    } else {
+                        "取消完成"
+                    }
+                ));
+            }
+            lines.extend(text.lines().map(|s| s.to_owned().into()));
+            let heights: Vec<_> = lines
+                .iter()
+                .scan(0usize, |offset, line| {
+                    let y = *offset;
+                    *offset += Paragraph::new(line.clone())
+                        .wrap(Wrap { trim: false })
+                        .line_count(body.width);
+                    Some((y, *offset))
+                })
+                .collect();
+            if reveal && let Some((_, line)) = positions.iter().find(|(i, _)| *i == focus) {
+                let y = heights[*line].0.min(u16::MAX as usize) as u16;
+                scroll = scroll
+                    .min(y)
+                    .max(y.saturating_sub(body.height.saturating_sub(1)));
+            }
+            reveal = false;
+            scroll = scroll.min(heights.last().map_or(0, |h| {
+                h.1.saturating_sub(body.height as usize)
+                    .min(u16::MAX as usize) as u16
+            }));
+            for (id, line) in positions {
+                let (start, end) = heights[line];
+                let from = start.max(scroll as usize);
+                let to = end.min(scroll as usize + body.height as usize);
+                if from < to {
+                    bounds.push((
+                        id,
+                        Rect::new(
+                            body.x,
+                            body.y + (from - scroll as usize) as u16,
+                            body.width,
+                            (to - from) as u16,
+                        ),
+                    ));
+                }
+            }
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                body,
+            );
+            let zones = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(bar);
+            for (i, (label, rect)) in [check, "进度设置"].iter().zip(zones.iter()).enumerate() {
+                let w = Paragraph::new(*label).centered();
+                f.render_widget(
+                    if i == focus {
+                        w.style(color.highlight())
+                    } else {
+                        w
+                    },
+                    *rect,
+                );
+                bounds.push((i, *rect));
+            }
+            f.render_widget(
+                Paragraph::new(if message.is_empty() {
+                    "Space 切换勾选，Enter 提交"
+                } else {
+                    &message
+                }),
+                footer,
+            );
+        })?;
+        let submit = match input()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Esc => return Ok(()),
+                KeyCode::Char(' ') if focus >= 2 => {
+                    ticks[focus - 2] = !ticks[focus - 2];
+                    false
+                }
+                KeyCode::Char(' ') if focus == 0 => {
+                    staged = !staged;
+                    message.clear();
+                    false
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(5);
+                    false
+                }
+                KeyCode::PageDown => {
+                    scroll = scroll.saturating_add(5);
+                    false
+                }
+                KeyCode::Enter => true,
+                KeyCode::Up if focus > 2 => {
+                    focus -= 1;
+                    reveal = true;
+                    false
+                }
+                KeyCode::Down if focus >= 2 && focus < ticks.len() + 1 => {
+                    focus += 1;
+                    reveal = true;
+                    false
+                }
+                KeyCode::Up if focus < 2 && !ticks.is_empty() => {
+                    focus = ticks.len() + 1;
+                    reveal = true;
+                    false
+                }
+                code if let Some(next) =
+                    super::focus_step(code, focus, 2 + ticks.len(), &bounds) =>
+                {
+                    focus = next;
+                    reveal = true;
+                    false
+                }
+                _ => false,
+            },
+            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((i, _)) = bounds
+                    .iter()
+                    .find(|(_, r)| r.contains(Position::new(m.column, m.row)))
+                {
+                    focus = *i;
+                    if focus >= 2 {
+                        ticks[focus - 2] = !ticks[focus - 2];
+                        false
+                    } else if focus == 0 {
+                        staged = !staged;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !submit {
+            continue;
+        }
+        let change = if focus == 0 {
+            if staged == letter.completed {
+                continue;
+            }
+            TaskChange::Completion(staged)
+        } else if focus >= 2 {
+            let item = &letter.checklist[focus - 2];
+            if item.checked == ticks[focus - 2] {
+                continue;
+            }
+            TaskChange::Checklist(crate::application::letters::ChecklistChange {
+                line: item.line,
+                checked: ticks[focus - 2],
+            })
+        } else {
+            let options = board
+                .iter()
+                .filter(|l| l.id != letter.id)
+                .map(|l| (l.id.as_str(), l.title.as_str()))
+                .collect::<Vec<_>>();
+            let Some(selected) = choose(
+                t,
+                color,
+                "进度设置 · 选择子任务",
+                &options,
+                &letter.dependencies,
+                true,
+            )?
+            else {
+                continue;
+            };
+            TaskChange::Subtasks {
+                selected,
+                observed: letter.dependencies.clone(),
+            }
+        };
+        match client.request(Request::Task {
+            letter: letter.id.clone(),
+            change,
+        }) {
+            Ok(Reply::Ready) => {
+                message = "已同步".into();
+                if let Reply::Published(letters) = client.request(Request::Published)?
+                    && let Some(updated) = letters.into_iter().find(|l| l.id == letter.id)
+                {
+                    for (i, item) in updated.checklist.iter().enumerate() {
+                        if focus == i + 2 || ticks[i] == letter.checklist[i].checked {
+                            ticks[i] = item.checked;
+                        }
+                    }
+                    if focus == 0 || staged == letter.completed {
+                        staged = updated.completed;
+                    }
+                    letter = updated;
+                }
+            }
+            Err(e) => message = e.to_string(),
+            _ => return Err(io::Error::other("Missing task acknowledgement")),
         }
     }
 }

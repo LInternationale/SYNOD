@@ -15,7 +15,11 @@ fn profile(config: &ClientConfig) -> io::Result<Option<Profile>> {
         .transpose()
         .map_err(io::Error::other)
 }
-pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
+#[cfg(test)]
+fn perform(file: &Path, request: Request) -> io::Result<Reply> {
+    perform_as(file, request, Entry::Human)
+}
+pub(super) fn perform_as(file: &Path, request: Request, entry: Entry) -> io::Result<Reply> {
     let mut config = ClientConfig::read(file)?;
     let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
     let mut current = profile(&config)?;
@@ -29,14 +33,70 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
             .insert("profile".into(), serde_json::to_value(p)?);
         config.save(file)?;
     }
+    if matches!(entry, Entry::Assistant) && !current.as_ref().is_some_and(|p| entry.bound(p)) {
+        return Err(io::Error::other(
+            "Select an active assistant identity in preferences",
+        ));
+    }
     match request {
-        Request::Published => {
+        Request::Task { letter, change } => {
+            let p = current.ok_or_else(|| io::Error::other("Team required"))?;
+            if !entry.bound(&p) {
+                return Err(io::Error::other("请先激活人类身份"));
+            }
+            let mut intent = operations::freeze_initial(entry.actor(&p))?;
+            intent.operation = format!(
+                "task-{}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(io::Error::other)?
+                    .as_nanos(),
+                std::process::id()
+            );
+            let dir = roots
+                .state
+                .join("teams")
+                .join(p.team.id())
+                .join("outbox")
+                .join(&intent.operation);
+            fs::create_dir_all(&dir)?;
+            write_local(
+                &dir.join("intent.json"),
+                &(&p.remote, &letter, &change, &intent),
+            )?;
+            operations::change_task(&roots.state, &p.team, &p.remote, &letter, &intent, &change)?;
+            fs::remove_file(dir.join("intent.json"))?;
+            fs::remove_dir(dir)?;
+            Ok(Reply::Ready)
+        }
+        Request::Published | Request::Read(_) => {
             let team = current.ok_or_else(|| io::Error::other("Team required"))?;
             if config.pending_team.is_some() {
                 return Ok(Reply::Published(Vec::new()));
             }
-            let (manifest, letters) =
+            let (manifest, mut letters) =
                 operations::published_snapshot(&roots.state, &team.team, &team.remote)?;
+            let actor = entry.actor(&team);
+            let receipts = roots
+                .state
+                .join("teams")
+                .join(team.team.id())
+                .join("notices")
+                .join(actor);
+            for letter in &mut letters {
+                let event = letter
+                    .events
+                    .first()
+                    .ok_or_else(|| io::Error::other("Missing send event"))?;
+                let directed = !actor.is_empty()
+                    && (letter.to == actor || letter.cc.iter().any(|c| c == actor));
+                letter.unread = directed && !receipts.join(&event.event_id).exists();
+                if letter.unread && matches!(&request,Request::Read(id) if id==&letter.id) {
+                    fs::create_dir_all(&receipts)?;
+                    fs::write(receipts.join(&event.event_id), b"read")?;
+                    letter.unread = false;
+                }
+            }
             if serde_json::to_value(&manifest)? != serde_json::to_value(&team.team)? {
                 save_profile(
                     config,
@@ -46,6 +106,13 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                         ..team
                     },
                 )?;
+            }
+            if let Request::Read(id) = request {
+                return letters
+                    .into_iter()
+                    .find(|l| l.id == id)
+                    .map(Reply::Letter)
+                    .ok_or_else(|| io::Error::other("Unknown published letter"));
             }
             Ok(Reply::Published(letters))
         }
@@ -258,7 +325,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
         }
         Request::Drafts | Request::SaveDraft(_) | Request::Send(_) => {
             let team = current.ok_or_else(|| io::Error::other("Team required"))?;
-            if team.human.is_empty() {
+            if entry.actor(&team).is_empty() {
                 return if matches!(request, Request::Drafts) {
                     Ok(Reply::Drafts(Vec::new()))
                 } else {
@@ -266,7 +333,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 };
             }
             team.team.validate()?;
-            if !team.team.human(&team.human) {
+            if !entry.bound(&team) {
                 return Err(io::Error::other("Invalid human identity"));
             }
             let base = roots
@@ -274,7 +341,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 .join("teams")
                 .join(team.team.id())
                 .join("drafts")
-                .join(&team.human);
+                .join(entry.actor(&team));
             fs::create_dir_all(&base)?;
             if let Request::Send(reference) = request {
                 if !reference
@@ -284,6 +351,9 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                     return Err(io::Error::other("Invalid draft reference"));
                 }
                 let copy = base.join(&reference).join("primary");
+                if copy.join("sent").is_file() {
+                    return Ok(Reply::Ready);
+                }
                 let draft: Draft = serde_json::from_slice(&fs::read(copy.join("editing.json"))?)?;
                 let pending = copy.join("send.json");
                 let prior: Option<operations::FrozenSend> = match fs::read(&pending) {
@@ -293,7 +363,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 };
                 let intent = match prior {
                     Some(i) if i.draft == draft => i,
-                    _ => operations::FrozenSend::new(&team.human, team.team.id(), draft)?,
+                    _ => operations::FrozenSend::new(entry.actor(&team), team.team.id(), draft)?,
                 };
                 let bytes = serde_json::to_vec(&intent)?;
                 let out = roots
@@ -311,6 +381,9 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 }
                 operations::send_letter(&roots.state, &team.team, &team.remote, &intent)?;
                 fs::write(copy.join("sent"), &intent.key)?;
+                fs::remove_file(out.join("intent.json"))?;
+                fs::remove_dir(out)?;
+                fs::remove_file(copy.join("send.json"))?;
                 return Ok(Reply::Ready);
             }
             if let Request::SaveDraft(mut draft) = request {
@@ -319,7 +392,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                     read_optional::<operations::FrozenSend>(&copy.join("save-pending.json"))?;
                 let intent = match prior {
                     Some(i) if i.draft == draft => i,
-                    _ => operations::FrozenSend::new(&team.human, team.team.id(), draft)?,
+                    _ => operations::FrozenSend::new(entry.actor(&team), team.team.id(), draft)?,
                 };
                 write_local(&copy.join("save-pending.json"), &intent)?;
                 write_local(&copy.join("editing.json"), &intent.draft)?;
@@ -347,7 +420,7 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 &roots.state,
                 &team.team,
                 &team.remote,
-                &team.human,
+                entry.actor(&team),
             );
             if let Ok((drafts, sent)) = remote {
                 local.retain(|(d, copy)| {

@@ -19,9 +19,9 @@ fn reads_fixture_and_rejects_incompatible_messages() -> Result<(), toml::de::Err
             decode(
                 &step
                     .message
-                    .replace("schema_version = 1", "schema_version = 2")
+                    .replace("schema_version = 1", "schema_version = 99")
             ),
-            Err(DecodeError::Version(2))
+            Err(DecodeError::Version(99))
         ));
         assert!(matches!(
             decode(&step.message.replace("+08:00", "")),

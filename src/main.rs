@@ -4,6 +4,9 @@ fn main() -> std::io::Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--session-host")) {
         return synod::session::transport::host(config);
     }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("mcp")) {
+        return synod::mcp::run(&config);
+    }
     synod::tui::live::run(&config)
 }
 #[cfg(not(unix))]

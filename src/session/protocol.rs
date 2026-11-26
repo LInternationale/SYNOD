@@ -1,9 +1,9 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
-    Hello(u8, String),
+    Hello(u8, String, Entry),
     Theme,
     ApplyTheme([u8; 3]),
     Profile,
@@ -25,6 +25,11 @@ pub enum Request {
         assistant: String,
     },
     Send(String),
+    Task {
+        letter: String,
+        change: crate::application::letters::TaskChange,
+    },
+    Read(String),
     Published,
     Drafts,
     SaveDraft(Draft),
@@ -37,6 +42,7 @@ pub enum Request {
 }
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
+    Letter(PublishedLetter),
     Published(Vec<PublishedLetter>),
     Work(WorkResult),
     Pending(bool),
@@ -74,4 +80,26 @@ pub enum WorkResult {
     Dirty,
     Conflict,
     Deferred,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub enum Entry {
+    Human,
+    Assistant,
+}
+impl Entry {
+    pub fn actor(self, profile: &Profile) -> &str {
+        match self {
+            Self::Human => &profile.human,
+            Self::Assistant => &profile.assistant,
+        }
+    }
+    pub fn bound(self, profile: &Profile) -> bool {
+        match self {
+            Self::Human => profile.team.human(&profile.human),
+            Self::Assistant => {
+                profile.team.human(&profile.human) && profile.team.assistant(&profile.assistant)
+            }
+        }
+    }
 }

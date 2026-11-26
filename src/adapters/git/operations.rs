@@ -115,7 +115,7 @@ pub fn publish_initial(
     };
     let manifest = serde_json::to_vec_pretty(team)?;
     let message = format!(
-        "kind = \"team.configured\"\n\nschema_version = 1\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n",
+        "kind = \"team.configured\"\n\nschema_version = 2\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n",
         toml::Value::String(team.id().into()),
         toml::Value::String(intent.operation.clone()),
         toml::Value::String(intent.actor.clone()),
@@ -198,6 +198,13 @@ pub fn published_snapshot(
         letter_id: String,
         title: String,
         from: String,
+        to: String,
+        #[serde(default)]
+        cc: Vec<String>,
+        #[serde(default)]
+        references: Vec<String>,
+        #[serde(default)]
+        initial_dependencies: Vec<String>,
     }
     let cache = root.join("teams").join(team.id()).join("repo.git");
     std::fs::create_dir_all(&cache)?;
@@ -211,6 +218,7 @@ pub fn published_snapshot(
     if actual.id() != team.id() {
         return Err(io::Error::other("Repository team identity has changed"));
     }
+    let mut events = super::history::replay(&cache, team.id())?;
     let paths = git(
         &cache,
         &[
@@ -249,13 +257,65 @@ pub fn published_snapshot(
             &["show", &format!("FETCH_HEAD:letters/{id}/body.md")],
         )?)
         .map_err(io::Error::other)?;
+        let facts = events
+            .remove(id)
+            .ok_or_else(|| io::Error::other("Published letter has no verified send event"))?;
+        let mut dependencies = env.initial_dependencies;
+        let mut completed = false;
+        let mut checklist = crate::application::letters::checklist(&body);
+        for ev in &facts {
+            match ev.kind.as_str() {
+                "ChecklistSet" => {
+                    let change = ev
+                        .checklist_change
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("Missing checklist change"))?;
+                    checklist
+                        .iter_mut()
+                        .find(|item| item.line == change.line)
+                        .ok_or_else(|| io::Error::other("Unknown checklist line"))?
+                        .checked = change.checked;
+                }
+                "MarkedCompleted" => completed = true,
+                "MarkedIncomplete" => completed = false,
+                "SubtasksSet" => {
+                    dependencies = ev
+                        .subtasks
+                        .clone()
+                        .ok_or_else(|| io::Error::other("Missing subtasks"))?
+                }
+                "DependencyAdded" => {
+                    let dep = ev
+                        .dependency
+                        .clone()
+                        .ok_or_else(|| io::Error::other("Missing dependency"))?;
+                    if !dependencies.contains(&dep) {
+                        dependencies.push(dep)
+                    }
+                }
+                "DependencyRemoved" => dependencies.retain(|d| Some(d) != ev.dependency.as_ref()),
+                _ => {}
+            }
+        }
         result.push(PublishedLetter {
+            checklist,
+            events: facts,
+            to: env.to,
+            cc: env.cc,
+            references: env.references,
+            dependencies,
+            unread: false,
+            progress: 0,
+            progress_done: 0,
+            progress_total: 0,
+            completed,
             id: env.letter_id,
             title: env.title,
             author: env.from,
             body,
         });
     }
+    crate::application::letters::project_progress(&mut result)?;
     Ok((actual, result))
 }
 
@@ -298,7 +358,7 @@ impl FrozenSend {
 pub(super) fn commit_message(kind: &str, send: &FrozenSend, target: &str) -> io::Result<String> {
     let quoted = |s: &str| toml::Value::String(s.to_owned()).to_string();
     let msg = format!(
-        "kind = {}\n\nschema_version = 1\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n\n[target]\n{target}\n",
+        "kind = {}\n\nschema_version = 2\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n\n[target]\n{target}\n",
         quoted(kind),
         quoted(&send.team),
         quoted(&format!("{kind}-{}", send.key)),
@@ -313,7 +373,12 @@ pub(super) fn commit(dir: &Path, msg: &str) -> io::Result<()> {
     let mut process = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["commit", "--cleanup=verbatim", "-F", "-"])
+        .arg("commit")
+        .args(
+            msg.starts_with("kind = \"letter.event\"")
+                .then_some("--allow-empty"),
+        )
+        .args(["--cleanup=verbatim", "-F", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -360,7 +425,7 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     use std::fs;
     team.validate()?;
     if team.id() != s.team
-        || !team.human(&s.actor)
+        || !(team.human(&s.actor) || team.assistant(&s.actor))
         || !s.key.bytes().all(|b| b.is_ascii_digit() || b == b'-')
     {
         return Err(io::Error::other("Invalid frozen send identity"));
@@ -384,11 +449,7 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
         .as_ref()
         .map_or("primary", |c| c.copy.as_str());
     let branch = format!("refs/heads/drafts/{}/{letter}/{copy}", s.actor);
-    let mut files = originals(s)?;
-    let event_path = format!("events/{event}.json");
-    let sent = serde_json::to_vec_pretty(
-        &serde_json::json!({"schema_version":1,"event_id":event,"letter_id":letter,"actor_id":s.actor,"occurred_at":s.timestamp,"kind":"LetterSent"}),
-    )?;
+    let files = originals(s)?;
     let draft_msg = commit_message(
         "draft.saved",
         s,
@@ -402,8 +463,17 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
     for round in 0..3 {
         let board = published_letters(root, team, remote)?;
         let cache = root.join("teams").join(team.id()).join("repo.git");
-        if board.iter().any(|l| l.id == letter) {
-            files.insert(event_path.clone(), sent.clone());
+        if let Some(existing) = board.iter().find(|l| l.id == letter) {
+            if !existing.events.iter().any(|e| {
+                e.kind == "LetterSent"
+                    && e.event_id == event
+                    && e.actor_id == s.actor
+                    && e.occurred_at == s.timestamp
+            }) {
+                return Err(io::Error::other(
+                    "Published operation differs from frozen send",
+                ));
+            }
             for (path, bytes) in &files {
                 if git(&cache, &["show", &format!("FETCH_HEAD:{prefix}/{path}")])? != *bytes {
                     return Err(io::Error::other(
@@ -483,24 +553,13 @@ pub fn send_letter(root: &Path, team: &NewTeam, remote: &str, s: &FrozenSend) ->
             .trim();
         git(&dir, &["switch", "--detach", base])?;
         git(&dir, &["merge", "--no-ff", "--no-commit", draft_oid])?;
-        let path = dir.join(&prefix).join(&event_path);
-        fs::create_dir_all(
-            path.parent()
-                .ok_or_else(|| io::Error::other("Missing event parent"))?,
-        )?;
-        fs::write(path, &sent)?;
-        git(&dir, &["add", "--", &format!("{prefix}/{event_path}")])?;
         let changes = git(&dir, &["diff", "--cached", "--name-only", "-z", base])?;
         let changed: std::collections::BTreeSet<_> = changes
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
-        let expected = files
-            .keys()
-            .chain(std::iter::once(&event_path))
-            .map(|p| format!("{prefix}/{p}"))
-            .collect();
+        let expected = files.keys().map(|p| format!("{prefix}/{p}")).collect();
         if changed != expected {
             return Err(io::Error::other("Unexpected candidate paths"));
         }
@@ -556,7 +615,7 @@ fn work_msg(kind: &str, team: &str, actor: &str, space: &str) -> io::Result<Stri
         .map_err(io::Error::other)?
         .as_nanos();
     let msg = format!(
-        "kind = \"{kind}\"\n\nschema_version = 1\nteam_id = \"{team}\"\noperation_id = \"work-{unique}-{}\"\nactor_id = \"{actor}\"\noccurred_at = {timestamp}\n\n[target]\nspace_id = \"{space}\"\n",
+        "kind = \"{kind}\"\n\nschema_version = 2\nteam_id = \"{team}\"\noperation_id = \"work-{unique}-{}\"\nactor_id = \"{actor}\"\noccurred_at = {timestamp}\n\n[target]\nspace_id = \"{space}\"\n",
         std::process::id()
     );
     super::commit_message::decode(&msg).map_err(|e| io::Error::other(format!("{e:?}")))?;
@@ -822,7 +881,7 @@ pub fn register_members(
         fs::write(dir.join("team.json"), serde_json::to_vec_pretty(&actual)?)?;
         let q = |s: &str| toml::Value::String(s.into()).to_string();
         let message = format!(
-            "kind = \"team.configured\"\n\nschema_version = 1\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n",
+            "kind = \"team.configured\"\n\nschema_version = 2\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n",
             q(team.id()),
             q(&intent.operation),
             q(&intent.actor),
@@ -841,4 +900,162 @@ pub fn register_members(
         }
     }
     Err(io::Error::other("Concurrent roster update; retry"))
+}
+
+/// Publish an immutable task change against the most recent team state.
+pub fn change_task(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    target: &str,
+    intent: &InitialCommit,
+    change: &crate::application::letters::TaskChange,
+) -> io::Result<()> {
+    use crate::application::letters::{LetterEvent, TaskChange};
+    use std::fs;
+    fn safe(s: &str) -> bool {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    }
+    if !safe(target)
+        || !safe(&intent.operation)
+        || !(team.human(&intent.actor) || team.assistant(&intent.actor))
+    {
+        return Err(io::Error::other("Invalid task change"));
+    }
+    let event_id = format!("evt-{}", intent.operation);
+
+    let (kind, subtasks) = match change {
+        TaskChange::Checklist(_) => ("ChecklistSet", None),
+        TaskChange::Completion(true) => ("MarkedCompleted", None),
+        TaskChange::Completion(false) => ("MarkedIncomplete", None),
+        TaskChange::Subtasks { selected, .. } => ("SubtasksSet", Some(selected.clone())),
+    };
+    let fact = LetterEvent {
+        schema_version: 1,
+        event_id: event_id.clone(),
+        letter_id: target.into(),
+        actor_id: intent.actor.clone(),
+        occurred_at: intent.timestamp.clone(),
+        kind: kind.into(),
+        checklist_change: match change {
+            TaskChange::Checklist(item) => Some(item.clone()),
+            _ => None,
+        },
+        percent: None,
+        dependency: None,
+        subtasks,
+    };
+    let bytes = serde_json::to_vec_pretty(&fact)?;
+    let mut msg = format!(
+        "kind = \"letter.event\"\n\nschema_version = 2\nteam_id = \"{}\"\noperation_id = \"{}\"\nactor_id = \"{}\"\noccurred_at = {}\n\n[target]\nletter_id = \"{target}\"\nevent_id = \"{event_id}\"\nevent_kind = \"{kind}\"\n",
+        team.id(),
+        intent.operation,
+        intent.actor,
+        intent.timestamp
+    );
+    if let Some(items) = &fact.subtasks {
+        msg.push_str(&format!(
+            "subtasks = {}\n",
+            toml::Value::try_from(items).map_err(io::Error::other)?
+        ));
+    }
+    if let Some(item) = &fact.checklist_change {
+        msg.push_str(&format!(
+            "[target.checklist_change]\nline = {}\nchecked = {}\n",
+            item.line, item.checked
+        ));
+    }
+    for _ in 0..3 {
+        let board = published_letters(root, team, remote)?;
+        let letter = board
+            .iter()
+            .find(|l| l.id == target)
+            .ok_or_else(|| io::Error::other("Unknown letter"))?;
+        if let Some(existing) = letter.events.iter().find(|e| e.event_id == event_id) {
+            if serde_json::to_vec_pretty(existing)? == bytes {
+                return Ok(());
+            }
+            return Err(io::Error::other("Task operation identity mismatch"));
+        }
+        match change {
+            TaskChange::Checklist(item) => {
+                let current = letter
+                    .checklist
+                    .iter()
+                    .find(|i| i.line == item.line)
+                    .ok_or_else(|| io::Error::other("Unknown checklist line"))?;
+                if current.checked == item.checked {
+                    return Ok(());
+                }
+            }
+            TaskChange::Completion(value) if *value == letter.completed => return Ok(()),
+            TaskChange::Completion(_) => {}
+            TaskChange::Subtasks { selected, observed } => {
+                if *selected == letter.dependencies {
+                    return Ok(());
+                }
+                if *observed != letter.dependencies {
+                    return Err(io::Error::other(
+                        "子任务已被其他成员更新，请重新打开进度设置",
+                    ));
+                }
+                let unique: std::collections::HashSet<_> = selected.iter().collect();
+                if unique.len() != selected.len() {
+                    return Err(io::Error::other("Duplicate subtask"));
+                }
+                let mut pending = selected.iter().map(String::as_str).collect::<Vec<_>>();
+                let mut seen = std::collections::HashSet::new();
+                while let Some(node) = pending.pop() {
+                    if node == target {
+                        return Err(io::Error::other("这些任务会形成循环"));
+                    }
+                    if seen.insert(node) {
+                        let entry = board
+                            .iter()
+                            .find(|l| l.id == node)
+                            .ok_or_else(|| io::Error::other("Unknown subtask"))?;
+                        pending.extend(entry.dependencies.iter().map(String::as_str))
+                    }
+                }
+            }
+        }
+        let cache = root.join("teams").join(team.id()).join("repo.git");
+        let base = git(&cache, &["rev-parse", "FETCH_HEAD"])?;
+        let dir = root
+            .join("teams")
+            .join(team.id())
+            .join("worktrees")
+            .join(format!("event-{}", intent.operation));
+        fs::create_dir_all(&dir)?;
+        git(&dir, &["init"])?;
+        git(&dir, &["config", "user.name", &intent.actor])?;
+        git(&dir, &["config", "user.email", "synod@localhost"])?;
+        git(
+            &dir,
+            &["fetch", "--no-tags", "--", remote, "refs/heads/main"],
+        )?;
+        if git(&dir, &["rev-parse", "FETCH_HEAD"])? != base {
+            continue;
+        }
+        git(
+            &dir,
+            &["switch", "--discard-changes", "--detach", "FETCH_HEAD"],
+        )?;
+        commit(&dir, &msg)?;
+        if !git(&dir, &["diff", "--name-only", "HEAD^", "HEAD"])?.is_empty() {
+            return Err(io::Error::other("Unexpected task event paths"));
+        }
+        if git(&dir, &["push", "--", remote, "HEAD:refs/heads/main"]).is_ok() {
+            let confirmed = published_letters(root, team, remote)?;
+            if confirmed
+                .iter()
+                .any(|l| l.id == target && l.events.iter().any(|e| e.event_id == event_id))
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(io::Error::other("Task publication not confirmed"))
 }
