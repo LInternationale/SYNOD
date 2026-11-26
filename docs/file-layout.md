@@ -76,8 +76,10 @@ workspace/<space-id>/<relative-path>
 ## 一台客户端的本机目录
 
 ```text
-<state-root>/
+<system-config>/synod/
   client.json
+
+<state-root>/
   runtime/
     owner.lock
     endpoint.json

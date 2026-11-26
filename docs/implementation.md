@@ -49,3 +49,25 @@ Only custom RGB is supported. Preferences edits three channels independently of 
 Bulletin verification: the public Ratatui test rendered the draft before the published letter, checked its label, activated all three buttons through both inputs, and opened the intended draft reference. Eight tests passed; bulletin branch coverage was 22/24.
 
 ThemeEditor takes the current color explicitly. Its apply operation preserves edits on invalid input or storage failure. Ten tests passed including the public apply example. Overall measured branch coverage is 38/40. The preference form, local storage adapter and live terminal integration remain outstanding.
+
+## Preference form and compose lifecycle
+
+The initial color is RGB(70,93,112). A settings view opens with the active channels, stages keyboard edits, and exposes Apply Settings by mouse or keyboard. Route the resulting persistence request through the client. Escape returns to the board. The form retains invalid or unsaved input. The compose lifecycle compares current inputs with the last locally saved snapshot, remains open on save, and returns directly or asks for discard on Escape. Retain the last saved draft when discarding later edits. A failed save preserves the editor and the previous snapshot. Frontend functions never call Git.
+
+Independent review: treating any keystroke as dirty prompts even after undo. Compare content. Capture success only after the client accepts persistence. Render and hit-test from the same geometry. Initial color is an explicit preference default and does not imply which other widgets to style. Test RGB defaults, both apply routes, failures, undo and discard.
+
+Only selected items and keyboard focus use the applied RGB. Pass it from the client into board rendering and the theme form, preserving the default renderer as a compatibility entry point. Both roots are user specified in setup. Repository provisioning may use an already authenticated gh executable after explicit confirmation.
+
+## Configuration location revision
+
+Put client.json in the operating system configuration directory. It contains both chosen root paths and preferences. Keep runtime locks, team caches, outbox, recovery and local draft data in the chosen state root. The shared host will own configuration writes after setup. Local settings storage preserves unrelated JSON fields and atomically installs a replacement after syncing the new file. A missing setting uses the agreed theme default. Reject malformed existing settings rather than replacing user data. Use create_new for staging and remove only the temporary file owned by this write. Test reopening, unrelated fields, malformed input and default lookup. This revision supersedes the old client.json location.
+
+## Repository provisioning adapter
+
+Use a typed pending repository request (owner, name, public/private choice). The setup controller displays these exact values for confirmation and consumes the request to produce a confirmed request. Only the confirmed type can invoke provisioning. Execute gh directly with an argument vector and no shell or token handling. Failure returns the process status and diagnostics. No remote call in tests. Test invalid operands and exact argument construction for both visibility choices.
+
+## Team setup inputs
+
+The creator enters three human names, three assistant names and the workspace names in setup. Preserve names as display data; generate stable path-safe member and space identifiers by position within the new manifest. Existing teams retain their supplied identifiers. Serialize the initial manifest using the same v1 field names and member kinds as the repository fixture. No membership identity needs to be selected to enter these fields. The setup controller will pass this manifest to the team history adapter after provisioning. Verify multilingual display data, all six identities and empty display-name errors.
+
+Implementation comparison: ThemeForm handles both apply routes; ThemeEditor keeps failed changes; board and form rendering use the applied color for highlights. ClientConfig resolves the OS path, decodes the default and atomically replaces settings. Editor snapshots implement escape and save semantics. The provisioning adapter accepts only confirmed values; the manifest builder accepts the creator's six display names and workspace names. Fifteen tests passed; measured branch coverage 80/96. A live TUI entry, session ownership, team initialization and all end-to-end publishing remain outstanding. No GitHub team repository was created during verification.

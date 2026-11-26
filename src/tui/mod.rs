@@ -3,7 +3,6 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
-    style::Modifier,
     widgets::{Block, List, ListItem, Paragraph, Wrap},
 };
 
@@ -71,7 +70,12 @@ impl BoardScreen {
 
     /// Draw the current screen into a Ratatui frame.
     pub fn render(&mut self, frame: &mut Frame<'_>, letters: &[LetterView<'_>]) {
-        self.render_area(frame, frame.area(), letters);
+        self.render_area(
+            frame,
+            frame.area(),
+            letters,
+            preferences::ThemeColor::default(),
+        );
     }
 
     fn render_area(
@@ -79,6 +83,7 @@ impl BoardScreen {
         frame: &mut Frame<'_>,
         area: ratatui::layout::Rect,
         letters: &[LetterView<'_>],
+        color: preferences::ThemeColor,
     ) {
         self.refresh(letters);
         let selection = self.position(letters);
@@ -95,7 +100,7 @@ impl BoardScreen {
         let items = letters.iter().enumerate().map(|(index, letter)| {
             let item = ListItem::new(letter.title);
             if Some(index) == selection {
-                item.style(Modifier::REVERSED)
+                item.style(color.highlight())
             } else {
                 item
             }
@@ -110,4 +115,5 @@ impl BoardScreen {
 }
 
 pub mod bulletin;
+pub mod compose;
 pub mod preferences;

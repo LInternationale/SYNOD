@@ -5,7 +5,6 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
-    style::Modifier,
     widgets::Paragraph,
 };
 
@@ -110,6 +109,15 @@ pub struct Bulletin {
 
 impl Bulletin {
     pub fn render(&mut self, frame: &mut Frame<'_>, rows: &BoardRows<'_>) {
+        self.render_with_theme(frame, rows, super::preferences::ThemeColor::default());
+    }
+
+    pub fn render_with_theme(
+        &mut self,
+        frame: &mut Frame<'_>,
+        rows: &BoardRows<'_>,
+        color: super::preferences::ThemeColor,
+    ) {
         let views = rows.views();
         self.screen.refresh(&views);
         if matches!(self.screen, BoardScreen::Detail(_)) {
@@ -117,11 +125,11 @@ impl Bulletin {
             return;
         }
         let (list, buttons) = layout(frame.area());
-        self.screen.render_area(frame, list, &views);
+        self.screen.render_area(frame, list, &views, color);
         for ((focus, label), area) in BUTTONS.into_iter().zip(buttons) {
             let widget = Paragraph::new(label).centered();
             let widget = if focus == self.focus {
-                widget.style(Modifier::REVERSED)
+                widget.style(color.highlight())
             } else {
                 widget
             };
