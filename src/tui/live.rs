@@ -281,18 +281,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             }
             BoardAction::Workspace => {
                 if let Reply::Files(names) = client.request(Request::Workspace)? {
-                    loop {
-                        t.draw(|f| {
-                            f.render_widget(
-                                Paragraph::new(names.join("\n"))
-                                    .block(Block::bordered().title("工作区")),
-                                f.area(),
-                            )
-                        })?;
-                        if matches!(input()?,Event::Key(k) if k.code==KeyCode::Esc) {
-                            break;
-                        }
-                    }
+                    workspace(t, color, &roots.work, &names)?;
                 }
             }
         }
@@ -462,6 +451,86 @@ fn compose(t: &mut Term, client: &mut Client, c: ThemeColor, mut saved: Draft) -
                 Ok(_) => return Err(io::Error::other("Missing save acknowledgement")),
                 Err(e) => msg = e.to_string(),
             },
+        }
+    }
+}
+
+fn workspace(t: &mut Term, color: ThemeColor, root: &Path, names: &[String]) -> io::Result<()> {
+    let mut button = false;
+    let mut offset = 0usize;
+    let mut error = String::new();
+    loop {
+        let mut hit = Rect::default();
+        t.draw(|f| {
+            let [tree, action, status] = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(f.area());
+            let height = usize::from(tree.height.saturating_sub(2));
+            offset = offset.min(names.len().saturating_sub(height));
+            let lines = names
+                .iter()
+                .skip(offset)
+                .take(height)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            f.render_widget(
+                Paragraph::new(lines).block(Block::bordered().title("工作区")),
+                tree,
+            );
+            hit = action;
+            let label = Paragraph::new("打开工作目录").centered();
+            f.render_widget(
+                if button {
+                    label.style(color.highlight())
+                } else {
+                    label
+                },
+                action,
+            );
+            f.render_widget(Paragraph::new(error.as_str()), status);
+        })?;
+        let activate = match input()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Esc => return Ok(()),
+                KeyCode::Tab => {
+                    button = !button;
+                    false
+                }
+                KeyCode::Up => {
+                    offset = offset.saturating_sub(1);
+                    false
+                }
+                KeyCode::Down => {
+                    offset = offset.saturating_add(1);
+                    false
+                }
+                KeyCode::Enter => button,
+                _ => false,
+            },
+            Event::Mouse(m)
+                if m.kind == MouseEventKind::Down(MouseButton::Left)
+                    && hit.contains(Position::new(m.column, m.row)) =>
+            {
+                button = true;
+                true
+            }
+            _ => false,
+        };
+        if activate {
+            let utility = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            match std::process::Command::new(utility).arg(root).output() {
+                Ok(out) if out.status.success() => error.clear(),
+                Ok(out) => error = String::from_utf8_lossy(&out.stderr).into_owned(),
+                Err(e) => error = e.to_string(),
+            }
         }
     }
 }
