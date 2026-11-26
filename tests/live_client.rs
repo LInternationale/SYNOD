@@ -46,37 +46,39 @@ fn isolated_terminal() {
     let config = root.join("client.json");
     let roots =
         bootstrap::initialize(&config, &root.join("state"), &root.join("work")).expect("roots");
-    let mut c = ClientConfig::read(&config).expect("settings");
-    let team = serde_json::from_str(include_str!("fixtures/v1/team/team.json")).expect("team");
-    let bare = root.join("remote.git");
-    assert!(
-        Command::new("git")
-            .args(["init", "--bare"])
-            .arg(&bare)
-            .output()
-            .expect("init")
-            .status
-            .success()
-    );
-    let remote = bare.to_str().expect("path");
-    operations::publish_initial(
-        &roots.state,
-        remote,
-        &team,
-        &operations::freeze_initial("member-alice").expect("timestamp"),
-    )
-    .expect("publish");
-    let profile = Profile {
-        team,
-        human: "member-alice".into(),
-        assistant: String::new(),
-        remote: remote.into(),
-    };
-    c.fields.insert(
-        "profile".into(),
-        serde_json::to_value(profile).expect("profile"),
-    );
-    c.save(&config).expect("settings");
+    if std::env::var_os("SYNOD_TEST_FIRST_RUN").is_none() {
+        let mut c = ClientConfig::read(&config).expect("settings");
+        let team = serde_json::from_str(include_str!("fixtures/v1/team/team.json")).expect("team");
+        let bare = root.join("remote.git");
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&bare)
+                .output()
+                .expect("init")
+                .status
+                .success()
+        );
+        let remote = bare.to_str().expect("path");
+        operations::publish_initial(
+            &roots.state,
+            remote,
+            &team,
+            &operations::freeze_initial("member-alice").expect("timestamp"),
+        )
+        .expect("publish");
+        let profile = Profile {
+            team,
+            human: "member-alice".into(),
+            assistant: String::new(),
+            remote: remote.into(),
+        };
+        c.fields.insert(
+            "profile".into(),
+            serde_json::to_value(profile).expect("profile"),
+        );
+        c.save(&config).expect("settings");
+    }
     let file = config.clone();
     let host = std::thread::spawn(move || synod::session::transport::host(file));
     let until = std::time::Instant::now() + std::time::Duration::from_secs(5);

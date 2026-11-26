@@ -92,7 +92,7 @@ impl BoardScreen {
             frame.render_widget(
                 Paragraph::new(letter.body)
                     .wrap(Wrap { trim: false })
-                    .block(page(letter.title)),
+                    .block(page(letter.title, color)),
                 area,
             );
             return;
@@ -106,7 +106,11 @@ impl BoardScreen {
             }
         });
         let mut state = ratatui::widgets::ListState::default().with_selected(selection);
-        frame.render_stateful_widget(List::new(items).block(page("公告板")), area, &mut state);
+        frame.render_stateful_widget(
+            List::new(items).block(page("公告板", color)),
+            area,
+            &mut state,
+        );
     }
 }
 
@@ -122,16 +126,62 @@ mod native_file;
 #[cfg(unix)]
 mod directory_setup;
 
-/// Move around a ring of controls, returning None for non-navigation keys.
-fn focus_step(code: KeyCode, index: usize, count: usize) -> Option<usize> {
-    match code {
-        KeyCode::Right | KeyCode::Down | KeyCode::Tab => Some((index + 1) % count),
-        KeyCode::Left | KeyCode::Up | KeyCode::BackTab => Some((index + count - 1) % count),
-        _ => None,
+/// Tab follows reading order. Arrows follow the rectangles actually displayed.
+fn focus_step(
+    code: KeyCode,
+    index: usize,
+    count: usize,
+    controls: &[(usize, ratatui::layout::Rect)],
+) -> Option<usize> {
+    if count == 0 {
+        return None;
     }
+    match code {
+        KeyCode::Tab => return Some((index + 1) % count),
+        KeyCode::BackTab => return Some((index + count - 1) % count),
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {}
+        _ => return None,
+    }
+    let horizontal = matches!(code, KeyCode::Left | KeyCode::Right);
+    let forward = matches!(code, KeyCode::Down | KeyCode::Right);
+    let axes = |r: ratatui::layout::Rect| {
+        if horizontal {
+            (r.x, r.right(), r.y, r.bottom())
+        } else {
+            (r.y, r.bottom(), r.x, r.right())
+        }
+    };
+    let (_, current) = controls.iter().find(|(i, _)| *i == index)?;
+    let (start, end, lo, hi) = axes(*current);
+    controls
+        .iter()
+        .filter(|(i, r)| *i != index && !r.is_empty())
+        .filter_map(|(i, r)| {
+            let (a, b, l, h) = axes(*r);
+            let gap = if forward {
+                a.checked_sub(end)?
+            } else {
+                start.checked_sub(b)?
+            };
+            let side = l.saturating_sub(hi).max(lo.saturating_sub(h));
+            let center = (u32::from(l) + u32::from(h)).abs_diff(u32::from(lo) + u32::from(hi));
+            Some(((l >= hi || h <= lo, gap, side, center, *i), *i))
+        })
+        .min_by_key(|(score, _)| *score)
+        .map(|(_, i)| i)
+        .or(Some(index))
 }
 
 /// The title occupies the first row and the content spans the available width.
-fn page(title: &str) -> Block<'_> {
-    Block::default().title(title)
+fn page(title: &str, color: preferences::ThemeColor) -> Block<'_> {
+    Block::default()
+        .title(title)
+        .title_style(
+            ratatui::style::Style::default()
+                .fg(color.rgb())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )
+        .padding(ratatui::widgets::Padding::new(0, 0, 1, 0))
 }
+
+mod input_field;

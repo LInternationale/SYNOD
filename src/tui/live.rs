@@ -62,6 +62,7 @@ struct Form<'a> {
     fields: Vec<Field<'a>>,
     buttons: &'a [&'a str],
     focus: usize,
+    help: &'a str,
 }
 enum Action {
     Back,
@@ -74,6 +75,7 @@ impl<'a> Form<'a> {
             fields,
             buttons,
             focus: 0,
+            help: "",
         }
     }
     fn interact(&mut self, t: &mut Term, color: ThemeColor, message: &str) -> io::Result<Action> {
@@ -82,9 +84,27 @@ impl<'a> Form<'a> {
         loop {
             t.draw(|f| {
                 let area = f.area();
-                let outer = super::page(self.title);
+                let outer = super::page(self.title, color);
                 let inner = outer.inner(area);
                 f.render_widget(outer, area);
+                let help = Paragraph::new(self.help).wrap(Wrap { trim: false });
+                let h = if self.help.is_empty() {
+                    0
+                } else {
+                    self.help
+                        .lines()
+                        .map(|line| {
+                            ratatui::text::Span::raw(line)
+                                .width()
+                                .div_ceil(usize::from(inner.width.max(1)))
+                                .max(1)
+                        })
+                        .sum::<usize>()
+                        .min(usize::from(inner.height.saturating_sub(4))) as u16
+                };
+                let [help_area, inner] =
+                    Layout::vertical([Constraint::Length(h), Constraint::Min(0)]).areas(inner);
+                f.render_widget(help, help_area);
                 let [fields, bar, status] = Layout::vertical([
                     Constraint::Min(0),
                     Constraint::Length(1),
@@ -108,15 +128,13 @@ impl<'a> Form<'a> {
                         1
                     };
                     let rect = Rect::new(fields.x, y, fields.width, height);
-                    let widget = Paragraph::new(format!("{}  {}", field.label, field.value))
-                        .wrap(Wrap { trim: false });
-                    f.render_widget(
-                        if i == self.focus {
-                            widget.style(color.highlight())
-                        } else {
-                            widget
-                        },
+                    super::input_field::render(
+                        f,
                         rect,
+                        field.label,
+                        &field.value,
+                        i == self.focus,
+                        color,
                     );
                     bounds.push((i, rect));
                     y += height;
@@ -144,7 +162,9 @@ impl<'a> Form<'a> {
             match input()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                     KeyCode::Esc => return Ok(Action::Back),
-                    code if let Some(next) = super::focus_step(code, self.focus, count) => {
+                    code if let Some(next) =
+                        super::focus_step(code, self.focus, count, &bounds) =>
+                    {
                         self.focus = next
                     }
                     KeyCode::Enter if self.focus >= self.fields.len() => {
@@ -182,7 +202,19 @@ impl<'a> Form<'a> {
     }
 }
 fn notice(t: &mut Term, c: ThemeColor, text: &str) -> io::Result<()> {
-    Form::new(text, vec![], &["返回"]).interact(t, c, "")?;
+    loop {
+        t.draw(|f| {
+            f.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .block(super::page("提示", c)),
+                f.area(),
+            )
+        })?;
+        if matches!(input()?,Event::Key(k) if k.kind==KeyEventKind::Press && k.code==KeyCode::Esc) {
+            break;
+        }
+    }
     Ok(())
 }
 fn handshake(client: &mut Client) -> io::Result<ThemeColor> {
@@ -390,66 +422,20 @@ fn registration(
 }
 fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<()> {
     let mut menu = Form::new("队伍设置", vec![], &["新建队伍", "加入已有队伍"]);
+    menu.help = "如果你是第一个开始协作的人，选择「新建队伍」。队友已建好队伍并发给你 GitHub 链接时，选择「加入已有队伍」。";
     loop {
         let choice = menu.interact(t, c, "")?;
         match choice {
             Action::Back => continue,
             Action::Button(0) => {
-                let labels = ["GitHub 账户", "仓库名", "工作区名称（以逗号分隔）"];
-                let mut form = Form::new(
-                    "新建队伍",
-                    labels.iter().map(|s| field(s, "")).collect(),
-                    &["私有仓库", "公开仓库"],
-                );
-                let mut msg = String::new();
-                loop {
-                    let Action::Button(choice) = form.interact(t, c, &msg)? else {
-                        break;
-                    };
-                    let owner = form.val(0);
-                    let name = form.val(1);
-                    let spaces = form
-                        .val(2)
-                        .split([',', '，'])
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect();
-                    let manifest =
-                        match NewTeam::empty(&format!("team-{}", name.replace('.', "-")), spaces) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                msg = format!("{e:?}");
-                                continue;
-                            }
-                        };
-                    let confirm = format!(
-                        "确认创建 {owner}/{name}（{}）",
-                        if choice == 0 { "私有" } else { "公开" }
-                    );
-                    if !matches!(
-                        Form::new(&confirm, vec![], &["确认创建", "返回"]).interact(t, c, "")?,
-                        Action::Button(0)
-                    ) {
-                        continue;
-                    }
-                    match client.request(Request::Create {
-                        owner,
-                        name,
-                        public: choice == 1,
-                        manifest,
-                    }) {
-                        Ok(_) => return Ok(()),
-                        Err(e) => msg = e.to_string(),
-                    }
+                if create_team_wizard(t, client, c)? {
+                    return Ok(());
                 }
             }
             Action::Button(_) => {
-                let mut form = Form::new(
-                    "加入已有队伍",
-                    vec![field("GitHub HTTPS 地址", "")],
-                    &["加入"],
-                );
+                let mut form =
+                    Form::new("加入已有队伍", vec![field("队伍仓库链接", "")], &["加入"]);
+                form.help = "粘贴队友发给你的仓库链接，格式为 https://github.com/账号/仓库名。";
                 let mut msg = String::new();
                 loop {
                     if matches!(form.interact(t, c, &msg)?, Action::Back) {
@@ -462,6 +448,113 @@ fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<()> {
                 }
             }
         }
+    }
+}
+/// Return true only after the final confirmation has provisioned the repository.
+fn create_team_wizard(t: &mut Term, client: &mut Client, color: ThemeColor) -> io::Result<bool> {
+    use crate::adapters::github::{RepositoryRequest, Visibility};
+    let mut owner = Form::new(
+        "新建队伍 · 1/5 · 选择存放位置",
+        vec![field("GitHub 用户名或组织名", "")],
+        &["下一步"],
+    );
+    owner.help = "队伍的信件和文件会保存在 GitHub 上。填写你的 GitHub 用户名，或你可以创建仓库的组织名。比如个人主页是 github.com/alice，就填 alice。";
+    let mut name = Form::new(
+        "新建队伍 · 2/5 · 给队伍仓库起名",
+        vec![field("仓库名", "")],
+        &["下一步"],
+    );
+    name.help = "仓库是队伍在 GitHub 上存放数据的地方。名称会成为网址的一部分，例如 contest-team。可用英文字母、数字、短横线、下划线和点。";
+    let mut spaces = Form::new(
+        "新建队伍 · 3/5 · 划分共享工作区",
+        vec![field("工作区名称", "")],
+        &["下一步"],
+    );
+    spaces.help = "哪些工作需要分开保存、提交和同步？例如填「代码，论文」就有两个工作区。用逗号隔开，暂时不需要可以留空。";
+    let mut access = Form::new(
+        "新建队伍 · 4/5 · 谁能查看队伍数据",
+        vec![],
+        &["仅有权限的人", "任何人"],
+    );
+    access.help = "选择「仅有权限的人」，只有获准访问这个 GitHub 仓库的人能查看。选择「任何人」，互联网上的任何人都能查看队伍的信件、草稿、附件和共享文件。";
+    let mut step = 0usize;
+    let mut public = false;
+    let mut error = String::new();
+    loop {
+        let names: Vec<String> = spaces.fields[0]
+            .value
+            .split([',', '，'])
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let overview = format!(
+            "队伍数据将存放在 github.com/{}/{}\n可查看数据的人：{}\n共享工作区：{}\n创建后，再添加本机要使用的人类和 AI 身份。",
+            owner.val(0),
+            name.val(0),
+            if public {
+                "任何人"
+            } else {
+                "仅有仓库访问权限的人"
+            },
+            if names.is_empty() {
+                "暂不设置".into()
+            } else {
+                names.join("、")
+            }
+        );
+        let action = match step {
+            0 => owner.interact(t, color, &error)?,
+            1 => name.interact(t, color, &error)?,
+            2 => spaces.interact(t, color, &error)?,
+            3 => access.interact(t, color, &error)?,
+            _ => {
+                let mut review =
+                    Form::new("新建队伍 · 5/5 · 核对并创建", vec![], &["确认创建队伍"]);
+                review.help = &overview;
+                review.interact(t, color, &error)?
+            }
+        };
+        error.clear();
+        let Action::Button(choice) = action else {
+            if step == 0 {
+                return Ok(false);
+            }
+            step -= 1;
+            continue;
+        };
+        match step {
+            0 if RepositoryRequest::new(&owner.val(0), "team", Visibility::Private).is_err() => {
+                error = "请填写 GitHub 用户名或组织名，例如 alice。".into();
+                continue;
+            }
+            1 if RepositoryRequest::new(&owner.val(0), &name.val(0), Visibility::Private)
+                .is_err() =>
+            {
+                error = "请填写可以用在仓库网址里的名称，例如 contest-team。".into();
+                continue;
+            }
+            3 => public = choice == 1,
+            4 => {
+                let manifest =
+                    NewTeam::empty(&format!("team-{}", name.val(0).replace('.', "-")), names)
+                        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+                match client.request(Request::Create {
+                    owner: owner.val(0),
+                    name: name.val(0),
+                    public,
+                    manifest,
+                }) {
+                    Ok(_) => return Ok(true),
+                    Err(e) => {
+                        error = e.to_string();
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        step += 1;
     }
 }
 fn compose(
@@ -559,11 +652,7 @@ fn compose(
                 let send = button == 6;
                 if send
                     && !matches!(
-                        Form::new("确认寄信", vec![], &["寄信", "返回"]).interact(
-                            t,
-                            c,
-                            &editing.title
-                        )?,
+                        Form::new("确认寄信", vec![], &["寄信"]).interact(t, c, &editing.title)?,
                         Action::Button(0)
                     )
                 {
@@ -602,6 +691,7 @@ fn workspace(
     let mut status = String::new();
     loop {
         let mut hits = Vec::new();
+        let mut bounds = Vec::new();
         t.draw(|f| {
             let [tree, bar, message] = Layout::vertical([
                 Constraint::Min(0),
@@ -609,7 +699,8 @@ fn workspace(
                 Constraint::Length(1),
             ])
             .areas(f.area());
-            let height = usize::from(tree.height.saturating_sub(1));
+            bounds.push((0, tree));
+            let height = usize::from(tree.height.saturating_sub(2));
             offset = offset.min(names.len().saturating_sub(height));
             let lines = names
                 .iter()
@@ -618,7 +709,10 @@ fn workspace(
                 .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join("\n");
-            f.render_widget(Paragraph::new(lines).block(super::page("工作区")), tree);
+            f.render_widget(
+                Paragraph::new(lines).block(super::page("工作区", color)),
+                tree,
+            );
             let buttons = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(bar);
             for (i, (label, rect)) in ["打开工作目录", "保存工作", "提交工作"]
                 .iter()
@@ -635,6 +729,7 @@ fn workspace(
                     *rect,
                 );
                 hits.push(*rect);
+                bounds.push((i + 1, *rect));
             }
             f.render_widget(Paragraph::new(status.as_str()), message);
         })?;
@@ -647,13 +742,13 @@ fn workspace(
                 }
                 KeyCode::Down
                     if focus == 0
-                        && offset + usize::from(t.size()?.height.saturating_sub(3))
+                        && offset + usize::from(t.size()?.height.saturating_sub(4))
                             < names.len() =>
                 {
                     offset += 1;
                     false
                 }
-                code if let Some(next) = super::focus_step(code, focus, 4) => {
+                code if let Some(next) = super::focus_step(code, focus, 4, &bounds) => {
                     focus = next;
                     false
                 }
@@ -795,7 +890,7 @@ fn choose(
         let count = options.len() + 1;
         let mut hits = Vec::new();
         t.draw(|f| {
-            let block = super::page(title);
+            let block = super::page(title, color);
             let inner = block.inner(f.area());
             f.render_widget(block, f.area());
             let start = (focus + 1usize).saturating_sub(usize::from(inner.height));
@@ -828,7 +923,15 @@ fn choose(
         let activate = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(None),
-                code if let Some(next) = super::focus_step(code, focus, count) => {
+                KeyCode::Up => {
+                    focus = focus.saturating_sub(1);
+                    false
+                }
+                KeyCode::Down => {
+                    focus = (focus + 1).min(count - 1);
+                    false
+                }
+                code if let Some(next) = super::focus_step(code, focus, count, &hits) => {
                     focus = next;
                     false
                 }

@@ -36,8 +36,8 @@ fn draft_precedes_publication_and_buttons_share_actions() -> Result<(), std::con
             .map(|x| buffer[(x, row)].symbol())
             .collect::<String>()
     };
-    assert!(line(1).contains("Private") && line(1).contains("草"));
-    assert!(line(2).contains("Published"));
+    assert!(line(2).contains("Private") && line(2).contains("草"));
+    assert!(line(3).contains("Published"));
     assert_eq!(
         board.handle(key(KeyCode::Enter), area, &rows),
         Some(BoardAction::OpenDraft(drafts[0].reference))
@@ -99,13 +99,21 @@ fn quick_reply_targets_the_selected_published_letter() {
 fn arrows_reach_actions_from_both_ends_of_the_list() {
     let rows = BoardRows::new(&[], &[]);
     let area = Rect::new(0, 0, 60, 8);
+    let mut board = Bulletin::default();
+    for direction in [KeyCode::Left, KeyCode::Up, KeyCode::Right] {
+        board.handle(Event::Key(direction.into()), area, &rows);
+        assert_eq!(
+            board.handle(Event::Key(KeyCode::Enter.into()), area, &rows),
+            None
+        );
+    }
     for (direction, expected) in [
-        (KeyCode::Down, BoardAction::Compose),
-        (KeyCode::Right, BoardAction::Compose),
-        (KeyCode::Left, BoardAction::Workspace),
-        (KeyCode::Up, BoardAction::Workspace),
+        (KeyCode::Down, BoardAction::Preferences),
+        (KeyCode::Left, BoardAction::Compose),
+        (KeyCode::Right, BoardAction::Preferences),
+        (KeyCode::Right, BoardAction::Workspace),
+        (KeyCode::Right, BoardAction::Workspace),
     ] {
-        let mut board = Bulletin::default();
         board.handle(Event::Key(direction.into()), area, &rows);
         assert_eq!(
             board.handle(Event::Key(KeyCode::Enter.into()), area, &rows),

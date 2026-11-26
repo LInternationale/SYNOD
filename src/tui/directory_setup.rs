@@ -31,13 +31,13 @@ fn layout(area: Rect) -> [Rect; 4] {
         Constraint::Min(0),
         Constraint::Length(1),
     ])
-    .areas(super::page("").inner(area))
+    .areas(super::page("", ThemeColor::default()).inner(area))
 }
 
 impl DirectorySetup {
     pub fn render(&self, frame: &mut Frame<'_>, color: ThemeColor) {
         let area = frame.area();
-        frame.render_widget(super::page("首次设置"), area);
+        frame.render_widget(super::page("首次设置", color), area);
         let [state, work, status, finish] = layout(area);
         for (index, (label, rect)) in [
             ("本机状态目录", state),
@@ -67,7 +67,19 @@ impl DirectorySetup {
                 rect,
             );
         }
-        frame.render_widget(Paragraph::new(self.status.as_str()), status);
+        let hint = if self.status.is_empty() {
+            match self.focus {
+                0 => "选择一个文件夹，让 SYNOD 在这台电脑上保存草稿和同步记录。",
+                1 => "选择你平时编辑队伍文件的位置。这个目录要与本机状态目录分开。",
+                _ => "确认这两个位置后，继续设置队伍。",
+            }
+        } else {
+            &self.status
+        };
+        frame.render_widget(
+            Paragraph::new(hint).wrap(ratatui::widgets::Wrap { trim: false }),
+            status,
+        );
     }
 
     pub fn handle(
@@ -78,7 +90,11 @@ impl DirectorySetup {
     ) -> Action<'_> {
         match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                code if let Some(next) = super::focus_step(code, self.focus, 3) => {
+                code if let Some(next) = super::focus_step(code, self.focus, 3, &{
+                    let [a, b, _, c] = layout(area);
+                    [(0, a), (1, b), (2, c)]
+                }) =>
+                {
                     self.focus = next;
                     return Action::Stay;
                 }
@@ -136,12 +152,12 @@ mod tests {
             })
         };
         let left = MouseEventKind::Down(MouseButton::Left);
-        screen.handle(click(2, left), area, || {
+        screen.handle(click(3, left), area, || {
             Err(io::Error::other("picker unavailable"))
         });
         assert_eq!(screen.status, "picker unavailable");
-        screen.handle(click(1, left), area, || Ok(Some("/state".into())));
-        screen.handle(click(2, left), area, || Ok(Some("/work".into())));
+        screen.handle(click(2, left), area, || Ok(Some("/state".into())));
+        screen.handle(click(3, left), area, || Ok(Some("/work".into())));
         for event in [
             click(5, left),
             click(1, MouseEventKind::Moved),
@@ -172,12 +188,12 @@ mod tests {
         let area = Rect::new(0, 0, 46, 10);
         let mut setup = DirectorySetup::default();
         let key = |code: KeyCode| Event::Key(code.into());
-        setup.handle(key(KeyCode::Up), area, || Ok(None));
+        setup.handle(key(KeyCode::BackTab), area, || Ok(None));
         assert!(matches!(
             setup.handle(key(KeyCode::Enter), area, || Ok(None)),
             Action::Stay
         ));
-        setup.handle(key(KeyCode::Down), area, || Ok(None));
+        setup.handle(key(KeyCode::Tab), area, || Ok(None));
         setup.handle(key(KeyCode::Enter), area, || Ok(Some("/first".into())));
         setup.handle(key(KeyCode::Enter), area, || Ok(None));
         setup.handle(key(KeyCode::Down), area, || Ok(None));
@@ -193,6 +209,13 @@ mod tests {
         assert_eq!(terminal.backend().buffer()[(19, 9)].symbol(), "完");
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "首");
+        assert!(
+            buffer[(0, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(buffer[(0, 0)].fg, ThemeColor::default().rgb());
+        assert!((0..46).all(|x| buffer[(x, 1)].symbol() == " "));
         assert_eq!(buffer[(45, 0)].symbol(), " ");
         assert_eq!(buffer[(0, 9)].bg, buffer[(45, 9)].bg);
         assert_eq!(buffer[(0, 9)].bg, ratatui::style::Color::Rgb(70, 93, 112));

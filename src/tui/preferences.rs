@@ -11,6 +11,10 @@ impl Default for ThemeColor {
 }
 
 impl ThemeColor {
+    pub(super) fn rgb(self) -> Color {
+        let [r, g, b] = self.0;
+        Color::Rgb(r, g, b)
+    }
     pub(super) fn highlight(self) -> Style {
         let [r, g, b] = self.0;
         Style::default().bg(Color::Rgb(r, g, b))
@@ -122,30 +126,33 @@ impl ThemeForm {
     }
 
     fn areas(area: Rect) -> [Rect; 4] {
-        Layout::vertical([Constraint::Length(1); 4]).areas(super::page("").inner(area))
+        Layout::vertical([Constraint::Length(1); 4])
+            .areas(super::page("", ThemeColor::default()).inner(area))
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        frame.render_widget(super::page("偏好 · 设置主题色"), area);
-        let [r, g, b] = &self.editor.channels;
-        let labels = [
-            format!("R  {r}"),
-            format!("G  {g}"),
-            format!("B  {b}"),
-            String::from("应用设置"),
-        ];
-        for (index, (label, rect)) in labels.into_iter().zip(Self::areas(area)).enumerate() {
-            let line = Paragraph::new(label);
-            frame.render_widget(
-                if index == self.focus {
-                    line.style(self.editor.active().highlight())
-                } else {
-                    line
-                },
-                rect,
+        frame.render_widget(super::page("偏好 · 设置主题色", self.editor.active()), area);
+        let areas = Self::areas(area);
+        for (i, label) in ["R", "G", "B"].iter().enumerate() {
+            super::input_field::render(
+                frame,
+                areas[i],
+                label,
+                &self.editor.channels[i],
+                self.focus == i,
+                self.editor.active(),
             );
         }
+        let button = Paragraph::new("应用设置");
+        frame.render_widget(
+            if self.focus == 3 {
+                button.style(self.editor.active().highlight())
+            } else {
+                button
+            },
+            areas[3],
+        );
     }
 
     pub fn handle<E>(
@@ -169,7 +176,16 @@ impl ThemeForm {
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => return Ok(SettingsAction::Back),
-                code if let Some(next) = super::focus_step(code, self.focus, 4) => {
+                code if let Some(next) = super::focus_step(
+                    code,
+                    self.focus,
+                    4,
+                    &Self::areas(area)
+                        .into_iter()
+                        .enumerate()
+                        .collect::<Vec<_>>(),
+                ) =>
+                {
                     self.focus = next;
                     self.replace = true;
                 }

@@ -35,7 +35,7 @@ enum Focus {
 }
 
 impl Focus {
-    fn move_focus(self, code: KeyCode, reply: bool) -> Option<Self> {
+    fn move_focus(self, code: KeyCode, reply: bool, area: Rect) -> Option<Self> {
         let order = [
             Self::List,
             Self::Compose,
@@ -44,7 +44,15 @@ impl Focus {
             Self::Reply,
         ];
         let index = order.iter().position(|v| *v == self)?;
-        super::focus_step(code, index, if reply { 5 } else { 4 }).map(|i| order[i])
+        {
+            let (list, buttons) = layout(area, reply);
+            let controls = std::iter::once(list)
+                .chain(buttons.iter().copied())
+                .enumerate()
+                .collect::<Vec<_>>();
+            super::focus_step(code, index, controls.len(), &controls)
+        }
+        .map(|i| order[i])
     }
 
     fn action(self, selected: Option<&str>) -> Option<BoardAction<'static>> {
@@ -135,7 +143,7 @@ impl Bulletin {
         let views = rows.views();
         self.screen.refresh(&views);
         if matches!(self.screen, BoardScreen::Detail(_)) {
-            self.screen.render(frame, &views);
+            self.screen.render_area(frame, frame.area(), &views, color);
             return;
         }
         let (list, buttons) = layout(frame.area(), self.selected_letter().is_some());
@@ -170,9 +178,9 @@ impl Bulletin {
                     })
                 {
                     self.screen.navigate(key.code, &views);
-                } else if let Some(next) = self
-                    .focus
-                    .move_focus(key.code, self.selected_letter().is_some())
+                } else if let Some(next) =
+                    self.focus
+                        .move_focus(key.code, self.selected_letter().is_some(), area)
                 {
                     self.focus = next;
                 } else if key.code == KeyCode::Enter && self.focus != Focus::List {

@@ -37,7 +37,7 @@ fn form_applies_only_on_keyboard_or_mouse_activation() -> Result<(), std::conver
         form.handle(Event::Key(KeyCode::Enter.into()), area, &mut save),
         Ok(SettingsAction::Stay)
     );
-    for row in [2, 4] {
+    for row in [3, 5] {
         let event = Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 2,
