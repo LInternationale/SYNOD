@@ -95,7 +95,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Style},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
 };
 
 /// The owning TUI routes Back to the board.
@@ -122,12 +122,12 @@ impl ThemeForm {
     }
 
     fn areas(area: Rect) -> [Rect; 4] {
-        Layout::vertical([Constraint::Length(1); 4]).areas(Block::bordered().inner(area))
+        Layout::vertical([Constraint::Length(1); 4]).areas(super::page("").inner(area))
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        frame.render_widget(Block::bordered().title("偏好 · 设置主题色"), area);
+        frame.render_widget(super::page("偏好 · 设置主题色"), area);
         let [r, g, b] = &self.editor.channels;
         let labels = [
             format!("R  {r}"),
@@ -169,8 +169,8 @@ impl ThemeForm {
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => return Ok(SettingsAction::Back),
-                KeyCode::Tab => {
-                    self.focus = (self.focus + 1) % 4;
+                code if let Some(next) = super::focus_step(code, self.focus, 4) => {
+                    self.focus = next;
                     self.replace = true;
                 }
                 KeyCode::Enter if self.focus == 3 => self.editor.apply(save)?,

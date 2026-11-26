@@ -94,3 +94,22 @@ fn quick_reply_targets_the_selected_published_letter() {
         Some(BoardAction::QuickReply("letter-18".into()))
     );
 }
+
+#[test]
+fn arrows_reach_actions_from_both_ends_of_the_list() {
+    let rows = BoardRows::new(&[], &[]);
+    let area = Rect::new(0, 0, 60, 8);
+    for (direction, expected) in [
+        (KeyCode::Down, BoardAction::Compose),
+        (KeyCode::Right, BoardAction::Compose),
+        (KeyCode::Left, BoardAction::Workspace),
+        (KeyCode::Up, BoardAction::Workspace),
+    ] {
+        let mut board = Bulletin::default();
+        board.handle(Event::Key(direction.into()), area, &rows);
+        assert_eq!(
+            board.handle(Event::Key(KeyCode::Enter.into()), area, &rows),
+            Some(expected)
+        );
+    }
+}

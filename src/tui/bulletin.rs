@@ -35,14 +35,16 @@ enum Focus {
 }
 
 impl Focus {
-    fn next(self, reply: bool) -> Self {
-        match self {
-            Self::List => Self::Compose,
-            Self::Compose => Self::Preferences,
-            Self::Preferences => Self::Workspace,
-            Self::Workspace if reply => Self::Reply,
-            Self::Workspace | Self::Reply => Self::List,
-        }
+    fn move_focus(self, code: KeyCode, reply: bool) -> Option<Self> {
+        let order = [
+            Self::List,
+            Self::Compose,
+            Self::Preferences,
+            Self::Workspace,
+            Self::Reply,
+        ];
+        let index = order.iter().position(|v| *v == self)?;
+        super::focus_step(code, index, if reply { 5 } else { 4 }).map(|i| order[i])
     }
 
     fn action(self, selected: Option<&str>) -> Option<BoardAction<'static>> {
@@ -161,8 +163,18 @@ impl Bulletin {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if matches!(self.screen, BoardScreen::Detail(_)) {
                     self.screen.navigate(key.code, &views);
-                } else if key.code == KeyCode::Tab {
-                    self.focus = self.focus.next(self.selected_letter().is_some());
+                } else if self.focus == Focus::List
+                    && self.screen.position(&views).is_some_and(|index| {
+                        (key.code == KeyCode::Up && index > 0)
+                            || (key.code == KeyCode::Down && index + 1 < views.len())
+                    })
+                {
+                    self.screen.navigate(key.code, &views);
+                } else if let Some(next) = self
+                    .focus
+                    .move_focus(key.code, self.selected_letter().is_some())
+                {
+                    self.focus = next;
                 } else if key.code == KeyCode::Enter && self.focus != Focus::List {
                     return self.focus.action(self.selected_letter());
                 } else if self.focus == Focus::List {

@@ -123,3 +123,21 @@ Replace the two typed path fields in first-run setup with selectable directory r
 Independent review: cancelling or failing the picker must preserve earlier selections. Keep status above the bottom button; share layout rectangles for drawing and mouse input. Exercise the focus order, picker cancellation and completion using injected local choices; verify left alignment in a Ratatui buffer.
 
 Implementation comparison: live startup now drives DirectorySetup, which calls the native directory picker on activation and invokes bootstrap initialization only on completion. Buffer and input tests cover bottom-left placement, keyboard traversal, clicks, picker failure and cancellation, and incomplete choices. Full offline tests passed. Nightly reported 9/14 measured branches for the new screen. The graphical chooser itself was not opened during automation.
+
+## Keyboard and startup revision
+
+Use one previous/next focus rule for arrows, Tab and BackTab. Preserve arrow traversal of board rows and workspace preview scrolling; at the boundary move focus to actions. Enter activates the focused control. Escape remains local to the current navigation level. Root screens cannot end the process with Escape. Center the directory completion label across the entire interior row and preserve its mouse target.
+
+Independent review: board actions are conditional on the current letter, so reverse traversal must omit unavailable actions. Test rendered centered text and focus transitions in both directions. Keep Ctrl+C as the existing explicit quit action.
+
+## Extensible team roster
+
+Create the repository and persist an empty team first. The next screen optionally adds one human and one assistant and activates the supplied identities locally. Persist the pending wizard step so reopening cannot recreate the repository. A skipped empty roster remains editable later. For subsequent additions use stable operation-derived member IDs and reapply the append to fresh main before each ordinary push. Keep existing IDs and display names and allow arbitrary roster size. Reuse the v1 team.configured operation for roster updates. Verify independent skips, more than six members, and concurrent or retried updates against a bare remote. Separate initial publication from later roster amendments so a retry cannot rewrite published history.
+
+Local activation revision: represent no activation, human only, or human plus assistant as an exhaustive choice. Reject an assistant-only activation before any member creation or remote write. Ordinary roster additions may contain only an assistant because they do not change activation. Existing assistant-only settings are interpreted as inactive; retain the member in the team roster. A skipped unpublished team's later roster-only edits remain local until an identity can sign the initial publication. Check profile, initial registration, preferences and startup resume paths.
+
+## Borderless TUI pages
+
+Full-screen pages use a standalone title row with the content occupying the remaining width. Prompts may use a border if their title sits on a separate line; avoid embedding a title in any border. Apply this rule to future pages as well. Independent review: changing only the paint would leave an invisible border in hit testing and would misplace the full-width completion button. Derive page body and drawing from the same borderless title block. Verify the terminal buffer and bottom button hit area.
+
+Implementation comparison: all current full-page render paths use the shared borderless title block. Directory setup tests check the title and empty right edge, centered text, full-width focus color, and mouse target. Board tests exercise entering controls with all four arrows. The session test created an empty team in an isolated bare repository, registered the initial pair, rejected AI-only activation, grew the remote roster to nine, and confirmed additions preserved both active identities. Offline cargo tests passed; nightly branch coverage was 247/610 (40.49%). Real GitHub provisioning was not invoked for this change.

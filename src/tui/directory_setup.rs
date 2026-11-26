@@ -4,7 +4,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
 };
 use std::{
     io,
@@ -20,7 +20,7 @@ pub(super) struct DirectorySetup {
 
 pub(super) enum Action<'a> {
     Stay,
-    Exit,
+
     Finish(&'a Path, &'a Path),
 }
 
@@ -31,13 +31,13 @@ fn layout(area: Rect) -> [Rect; 4] {
         Constraint::Min(0),
         Constraint::Length(1),
     ])
-    .areas(Block::bordered().inner(area))
+    .areas(super::page("").inner(area))
 }
 
 impl DirectorySetup {
     pub fn render(&self, frame: &mut Frame<'_>, color: ThemeColor) {
         let area = frame.area();
-        frame.render_widget(Block::bordered().title("首次设置"), area);
+        frame.render_widget(super::page("首次设置"), area);
         let [state, work, status, finish] = layout(area);
         for (index, (label, rect)) in [
             ("本机状态目录", state),
@@ -57,6 +57,7 @@ impl DirectorySetup {
                 None => label.into(),
             };
             let line = Paragraph::new(text);
+            let line = if index == 2 { line.centered() } else { line };
             frame.render_widget(
                 if index == self.focus {
                     line.style(color.highlight())
@@ -77,15 +78,10 @@ impl DirectorySetup {
     ) -> Action<'_> {
         match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                KeyCode::Up | KeyCode::BackTab => {
-                    self.focus = (self.focus + 2) % 3;
+                code if let Some(next) = super::focus_step(code, self.focus, 3) => {
+                    self.focus = next;
                     return Action::Stay;
                 }
-                KeyCode::Down | KeyCode::Tab => {
-                    self.focus = (self.focus + 1) % 3;
-                    return Action::Stay;
-                }
-                KeyCode::Esc => return Action::Exit,
                 KeyCode::Enter => {}
                 _ => return Action::Stay,
             },
@@ -163,16 +159,16 @@ mod tests {
             ));
         }
         assert!(matches!(
-            screen.handle(click(8, left), area, || Ok(None)),
+            screen.handle(click(9, left), area, || Ok(None)),
             Action::Finish(..)
         ));
         assert!(matches!(
             screen.handle(Event::Key(KeyCode::Esc.into()), area, || Ok(None)),
-            Action::Exit
+            Action::Stay
         ));
     }
     #[test]
-    fn cancelled_reselection_and_bottom_left_completion() -> io::Result<()> {
+    fn cancelled_reselection_and_centered_completion() -> io::Result<()> {
         let area = Rect::new(0, 0, 46, 10);
         let mut setup = DirectorySetup::default();
         let key = |code: KeyCode| Event::Key(code.into());
@@ -194,7 +190,12 @@ mod tests {
         terminal
             .draw(|f| setup.render(f, ThemeColor::default()))
             .unwrap();
-        assert_eq!(terminal.backend().buffer()[(1, 8)].symbol(), "完");
+        assert_eq!(terminal.backend().buffer()[(19, 9)].symbol(), "完");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "首");
+        assert_eq!(buffer[(45, 0)].symbol(), " ");
+        assert_eq!(buffer[(0, 9)].bg, buffer[(45, 9)].bg);
+        assert_eq!(buffer[(0, 9)].bg, ratatui::style::Color::Rgb(70, 93, 112));
         Ok(())
     }
 }

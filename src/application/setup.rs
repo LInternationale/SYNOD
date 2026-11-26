@@ -2,27 +2,27 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum MemberKind {
     Human,
     Assistant,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Member {
     actor_id: String,
     kind: MemberKind,
     display_name: String,
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Space {
     space_id: String,
     display_name: String,
 }
 
 /// Initial team configuration, in the repository's version-one wire format.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NewTeam {
     schema_version: u8,
     team_id: String,
@@ -39,11 +39,24 @@ pub enum SetupError {
 }
 
 impl NewTeam {
-    /// Prepare a manifest from the creator's six member names and workspace names.
-    pub fn from_wizard(
+    /// Prepare a manifest from the creator's member names and workspace names.
+    pub fn from_wizard<const H: usize, const A: usize>(
         team_id: &str,
-        humans: [String; 3],
-        assistants: [String; 3],
+        humans: [String; H],
+        assistants: [String; A],
+        spaces: Vec<String>,
+    ) -> Result<Self, SetupError> {
+        Self::from_names(team_id, humans.to_vec(), assistants.to_vec(), spaces)
+    }
+
+    pub fn empty(team_id: &str, spaces: Vec<String>) -> Result<Self, SetupError> {
+        Self::from_names(team_id, vec![], vec![], spaces)
+    }
+
+    fn from_names(
+        team_id: &str,
+        humans: Vec<String>,
+        assistants: Vec<String>,
         spaces: Vec<String>,
     ) -> Result<Self, SetupError> {
         if team_id.is_empty()
@@ -53,7 +66,7 @@ impl NewTeam {
         {
             return Err(SetupError::InvalidTeamId);
         }
-        let mut members = Vec::with_capacity(6);
+        let mut members = Vec::with_capacity(humans.len() + assistants.len());
         for (i, display_name) in humans.into_iter().enumerate() {
             if display_name.trim().is_empty() {
                 return Err(SetupError::EmptyHumanName(i));
@@ -97,7 +110,7 @@ impl NewTeam {
 }
 
 /// A local-only initial manifest waiting for an identity and remote confirmation.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PendingTeam {
     manifest: NewTeam,
 }
@@ -172,5 +185,71 @@ impl NewTeam {
             return Err(std::io::Error::other("Invalid team manifest"));
         }
         Ok(())
+    }
+}
+
+impl NewTeam {
+    /// Append each supplied name once for a stable registration operation.
+    pub fn register(
+        &mut self,
+        key: &str,
+        human: &str,
+        assistant: &str,
+    ) -> std::io::Result<(String, String)> {
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(std::io::Error::other("Invalid registration identifier"));
+        }
+        let mut ids = [String::new(), String::new()];
+        for (index, (prefix, kind, name)) in [
+            ("member", MemberKind::Human, human),
+            ("assistant", MemberKind::Assistant, assistant),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let id = format!("{prefix}-{key}");
+            if let Some(existing) = self.members.iter().find(|m| m.actor_id == id) {
+                if existing.display_name != name {
+                    return Err(std::io::Error::other("Registration identifier reused"));
+                }
+            } else {
+                self.members.push(Member {
+                    actor_id: id.clone(),
+                    kind,
+                    display_name: name.into(),
+                })
+            }
+            ids[index] = id;
+        }
+        let [h, a] = ids;
+        Ok((h, a))
+    }
+}
+
+/// Locally bound identities. Roster membership alone does not activate a slot.
+pub enum Activation<'a> {
+    Inactive,
+    Human(&'a str),
+    Pair(&'a str, &'a str),
+}
+impl<'a> Activation<'a> {
+    pub fn parse(human: &'a str, assistant: &'a str) -> std::io::Result<Self> {
+        match (human.trim(), assistant.trim()) {
+            ("", "") => Ok(Self::Inactive),
+            ("", _) => Err(std::io::Error::other("请先激活人类身份，再激活 AI")),
+            (h, "") => Ok(Self::Human(h)),
+            (h, a) => Ok(Self::Pair(h, a)),
+        }
+    }
+    pub fn slots(self) -> (&'a str, &'a str) {
+        match self {
+            Self::Inactive => ("", ""),
+            Self::Human(h) => (h, ""),
+            Self::Pair(h, a) => (h, a),
+        }
     }
 }

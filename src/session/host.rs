@@ -18,18 +18,36 @@ fn profile(config: &ClientConfig) -> io::Result<Option<Profile>> {
 pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
     let mut config = ClientConfig::read(file)?;
     let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
-    let current = profile(&config)?;
+    let mut current = profile(&config)?;
+    if let Some(p) = current.as_mut()
+        && p.human.is_empty()
+        && !p.assistant.is_empty()
+    {
+        p.assistant.clear();
+        config
+            .fields
+            .insert("profile".into(), serde_json::to_value(p)?);
+        config.save(file)?;
+    }
     match request {
         Request::Published => {
             let team = current.ok_or_else(|| io::Error::other("Team required"))?;
             if config.pending_team.is_some() {
                 return Ok(Reply::Published(Vec::new()));
             }
-            Ok(Reply::Published(operations::published_letters(
-                &roots.state,
-                &team.team,
-                &team.remote,
-            )?))
+            let (manifest, letters) =
+                operations::published_snapshot(&roots.state, &team.team, &team.remote)?;
+            if serde_json::to_value(&manifest)? != serde_json::to_value(&team.team)? {
+                save_profile(
+                    config,
+                    file,
+                    Profile {
+                        team: manifest,
+                        ..team
+                    },
+                )?;
+            }
+            Ok(Reply::Published(letters))
         }
         Request::Profile => Ok(Reply::Team(current)),
         Request::Create {
@@ -56,6 +74,9 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
             req.confirm()
                 .create()
                 .map_err(|e| io::Error::other(format!("{e:?}")))?;
+            config
+                .fields
+                .insert("setup_members_pending".into(), true.into());
             let data = serde_json::to_value(&manifest)?;
             config.pending_team = Some(crate::application::setup::PendingTeam::new(manifest));
             let profile = Profile {
@@ -92,7 +113,106 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                 },
             )
         }
+        Request::SetupPending => Ok(Reply::Pending(
+            config
+                .fields
+                .get("setup_members_pending")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )),
+        Request::Register {
+            human,
+            assistant,
+            initial,
+        } => {
+            let mut team = current.ok_or_else(|| io::Error::other("Team required"))?;
+            if initial
+                && config
+                    .fields
+                    .get("setup_members_pending")
+                    .and_then(|v| v.as_bool())
+                    != Some(true)
+            {
+                return Err(io::Error::other("Initial registration already complete"));
+            }
+            if initial {
+                crate::application::setup::Activation::parse(&human, &assistant)?;
+            }
+            let prior = config.fields.get("registration").cloned();
+            let (human, assistant, initial, intent): (
+                String,
+                String,
+                bool,
+                operations::InitialCommit,
+            ) = match prior {
+                Some(v) => serde_json::from_value(v)?,
+                None => {
+                    if human.trim().is_empty() && assistant.trim().is_empty() {
+                        if initial {
+                            config.fields.remove("setup_members_pending");
+                            config.save(file)?
+                        }
+                        return Ok(Reply::Team(Some(team)));
+                    }
+                    if !initial && team.human.is_empty() && config.pending_team.is_none() {
+                        return Err(io::Error::other("请先选择署名的人类身份"));
+                    }
+                    let key = format!(
+                        "reg-{}-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(io::Error::other)?
+                            .as_nanos(),
+                        std::process::id()
+                    );
+                    let author = if !team.human.is_empty() {
+                        team.human.clone()
+                    } else if !team.assistant.is_empty() {
+                        team.assistant.clone()
+                    } else if !human.trim().is_empty() {
+                        format!("member-{key}")
+                    } else {
+                        format!("assistant-{key}")
+                    };
+                    let mut intent = operations::freeze_initial(&author)?;
+                    intent.operation = key;
+                    config.fields.insert(
+                        "registration".into(),
+                        serde_json::to_value((&human, &assistant, initial, &intent))?,
+                    );
+                    config.save(file)?;
+                    (human, assistant, initial, intent)
+                }
+            };
+            let (h, a) = team.team.register(&intent.operation, &human, &assistant)?;
+            if config.pending_team.is_some() && !initial && team.human.is_empty() {
+                config.pending_team = Some(crate::application::setup::PendingTeam::new(
+                    team.team.clone(),
+                ));
+            } else if config.pending_team.is_some() {
+                operations::publish_initial(&roots.state, &team.remote, &team.team, &intent)?;
+                config.pending_team = None;
+            } else {
+                team.team = operations::register_members(
+                    &roots.state,
+                    &team.remote,
+                    &team.team,
+                    &intent,
+                    &human,
+                    &assistant,
+                )?;
+            }
+            if initial {
+                team.human = h;
+                team.assistant = a;
+            }
+            config.fields.remove("registration");
+            config.fields.remove("setup_members_pending");
+            save_profile(config, file, team)
+        }
         Request::Identities { human, assistant } => {
+            let (human, assistant) =
+                crate::application::setup::Activation::parse(&human, &assistant)?.slots();
             let mut team = current.ok_or_else(|| io::Error::other("Team required"))?;
             if !(human.is_empty() || team.team.human(&human))
                 || !(assistant.is_empty() || team.team.assistant(&assistant))
@@ -101,8 +221,8 @@ pub(super) fn perform(file: &Path, request: Request) -> io::Result<Reply> {
                     "Unknown member or incorrect identity slot",
                 ));
             }
-            team.human = human;
-            team.assistant = assistant;
+            team.human = human.into();
+            team.assistant = assistant.into();
             if let Some(pending) = &config.pending_team {
                 let actor = if !team.human.is_empty() {
                     Some(team.human.as_str())
@@ -282,4 +402,111 @@ fn save_profile(mut config: ClientConfig, file: &Path, p: Profile) -> io::Result
         .insert("profile".into(), serde_json::to_value(&p)?);
     config.save(file)?;
     Ok(Reply::Team(Some(p)))
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use crate::application::setup::{NewTeam, PendingTeam};
+    #[test]
+    fn registration_grows_roster_and_preserves_activation() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("synod-roster-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let file = root.join("client.json");
+        bootstrap::initialize(&file, &root.join("state"), &root.join("work"))?;
+        let remote = root.join("team.git");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&remote)
+                .output()?
+                .status
+                .success()
+        );
+        let team = NewTeam::empty("team-test", vec![]).expect("valid empty roster");
+        let mut config = ClientConfig::read(&file)?;
+        config.pending_team = Some(PendingTeam::new(team.clone()));
+        config
+            .fields
+            .insert("setup_members_pending".into(), true.into());
+        save_profile(
+            config,
+            &file,
+            Profile {
+                team,
+                human: String::new(),
+                assistant: String::new(),
+                remote: remote.display().to_string(),
+            },
+        )?;
+        let register = |h: &str, a: &str, initial| {
+            perform(
+                &file,
+                Request::Register {
+                    human: h.into(),
+                    assistant: a.into(),
+                    initial,
+                },
+            )
+        };
+        assert!(register("", "bot", true).is_err());
+        let Reply::Team(Some(first)) = register("Alice", "Alice's bot", true)? else {
+            panic!("missing profile")
+        };
+        assert!(first.team.human(&first.human) && first.team.assistant(&first.assistant));
+        for n in 0..3 {
+            register(&format!("Human {n}"), &format!("AI {n}"), false)?;
+        }
+        let Reply::Team(Some(last)) = register("", "One more AI", false)? else {
+            panic!("missing profile")
+        };
+        assert_eq!(last.team.roster().len(), 9);
+        assert_eq!(last.human, first.human);
+        assert_eq!(last.assistant, first.assistant);
+        assert!(
+            perform(
+                &file,
+                Request::Identities {
+                    human: "".into(),
+                    assistant: first.assistant.clone()
+                }
+            )
+            .is_err()
+        );
+        let Reply::Team(Some(human)) = perform(
+            &file,
+            Request::Identities {
+                human: first.human,
+                assistant: "".into(),
+            },
+        )?
+        else {
+            panic!("missing profile")
+        };
+        assert!(human.assistant.is_empty());
+        assert!(human.team.human(&human.human));
+        let Reply::Team(Some(inactive)) = perform(
+            &file,
+            Request::Identities {
+                human: "".into(),
+                assistant: "".into(),
+            },
+        )?
+        else {
+            panic!("missing profile")
+        };
+        assert!(inactive.human.is_empty() && inactive.assistant.is_empty());
+        let remote_manifest = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(remote)
+            .args(["show", "main:team.json"])
+            .output()?;
+        assert_eq!(
+            serde_json::from_slice::<NewTeam>(&remote_manifest.stdout)?
+                .roster()
+                .len(),
+            9
+        );
+        fs::remove_dir_all(root)
+    }
 }

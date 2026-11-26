@@ -1,12 +1,18 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Hello(u8, String),
     Theme,
     ApplyTheme([u8; 3]),
     Profile,
+    SetupPending,
+    Register {
+        human: String,
+        assistant: String,
+        initial: bool,
+    },
     Join(String),
     Create {
         owner: String,
@@ -33,6 +39,7 @@ pub enum Request {
 pub enum Reply {
     Published(Vec<PublishedLetter>),
     Work(WorkResult),
+    Pending(bool),
     Ready,
     Team(Option<Profile>),
     Drafts(Vec<Draft>),

@@ -117,6 +117,8 @@ fn connection(stream: UnixStream, file: Arc<Mutex<PathBuf>>, generation: String)
                 Request::Theme => Ok(Reply::Color(ClientConfig::read(&file)?.theme_rgb)),
                 Request::Close => Ok(Reply::Ready),
                 other @ (Request::Profile
+                | Request::Register { .. }
+                | Request::SetupPending
                 | Request::Join(_)
                 | Request::Create { .. }
                 | Request::Identities { .. }

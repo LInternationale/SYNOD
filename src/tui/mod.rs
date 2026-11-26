@@ -92,7 +92,7 @@ impl BoardScreen {
             frame.render_widget(
                 Paragraph::new(letter.body)
                     .wrap(Wrap { trim: false })
-                    .block(Block::bordered().title(letter.title)),
+                    .block(page(letter.title)),
                 area,
             );
             return;
@@ -106,11 +106,7 @@ impl BoardScreen {
             }
         });
         let mut state = ratatui::widgets::ListState::default().with_selected(selection);
-        frame.render_stateful_widget(
-            List::new(items).block(Block::bordered().title("公告板")),
-            area,
-            &mut state,
-        );
+        frame.render_stateful_widget(List::new(items).block(page("公告板")), area, &mut state);
     }
 }
 
@@ -125,3 +121,17 @@ mod native_file;
 
 #[cfg(unix)]
 mod directory_setup;
+
+/// Move around a ring of controls, returning None for non-navigation keys.
+fn focus_step(code: KeyCode, index: usize, count: usize) -> Option<usize> {
+    match code {
+        KeyCode::Right | KeyCode::Down | KeyCode::Tab => Some((index + 1) % count),
+        KeyCode::Left | KeyCode::Up | KeyCode::BackTab => Some((index + count - 1) % count),
+        _ => None,
+    }
+}
+
+/// The title occupies the first row and the content spans the available width.
+fn page(title: &str) -> Block<'_> {
+    Block::default().title(title)
+}

@@ -19,7 +19,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Position, Rect},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use std::{
     io::{self, Stdout},
@@ -82,7 +82,7 @@ impl<'a> Form<'a> {
         loop {
             t.draw(|f| {
                 let area = f.area();
-                let outer = Block::bordered().title(self.title);
+                let outer = super::page(self.title);
                 let inner = outer.inner(area);
                 f.render_widget(outer, area);
                 let [fields, bar, status] = Layout::vertical([
@@ -144,8 +144,9 @@ impl<'a> Form<'a> {
             match input()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                     KeyCode::Esc => return Ok(Action::Back),
-                    KeyCode::Tab => self.focus = (self.focus + 1) % count,
-                    KeyCode::BackTab => self.focus = (self.focus + count - 1) % count,
+                    code if let Some(next) = super::focus_step(code, self.focus, count) => {
+                        self.focus = next
+                    }
                     KeyCode::Enter if self.focus >= self.fields.len() => {
                         return Ok(Action::Button(self.focus - self.fields.len()));
                     }
@@ -211,7 +212,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 let area = t.draw(|frame| setup.render(frame, initial))?.area;
                 match setup.handle(input()?, area, super::native_file::directory) {
                     super::directory_setup::Action::Stay => {}
-                    super::directory_setup::Action::Exit => return Ok(()),
+
                     super::directory_setup::Action::Finish(state, work) => {
                         match bootstrap::initialize(file, state, work) {
                             Ok(roots) => break roots,
@@ -224,11 +225,14 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
     };
     let mut client = Client::connect(&roots.state)?;
     let mut color = handshake(&mut client)?;
-    if matches!(client.request(Request::Profile)?, Reply::Team(None)) {
-        if !setup(t, &mut client, color)? {
-            return Ok(());
-        }
-        identities(t, &mut client, color)?;
+    let new_profile = matches!(client.request(Request::Profile)?, Reply::Team(None));
+    if new_profile {
+        setup(t, &mut client, color)?
+    }
+    if matches!(client.request(Request::SetupPending)?, Reply::Pending(true)) {
+        registration(t, &mut client, color, true)?
+    } else if new_profile {
+        identities(t, &mut client, color)?
     }
     let mut board = Bulletin::default();
     let mut published = Vec::new();
@@ -285,7 +289,7 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 }
             }
             BoardAction::Preferences => {
-                let mut menu = Form::new("偏好", vec![], &["设置主题色", "身份"]);
+                let mut menu = Form::new("偏好", vec![], &["设置主题色", "身份", "添加成员"]);
                 match menu.interact(t, color, "")? {
                     Action::Button(0) => {
                         let mut form = ThemeForm::new(color);
@@ -300,7 +304,8 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                             }
                         }
                     }
-                    Action::Button(_) => identities(t, &mut client, color)?,
+                    Action::Button(1) => identities(t, &mut client, color)?,
+                    Action::Button(_) => registration(t, &mut client, color, false)?,
                     Action::Back => {}
                 }
             }
@@ -345,24 +350,52 @@ fn identities(t: &mut Term, client: &mut Client, color: ThemeColor) -> io::Resul
         }
     }
 }
-fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<bool> {
+fn registration(
+    t: &mut Term,
+    client: &mut Client,
+    color: ThemeColor,
+    initial: bool,
+) -> io::Result<()> {
+    let buttons: &[&str] = if initial {
+        &["添加并激活", "跳过"]
+    } else {
+        &["添加成员"]
+    };
+    let mut form = Form::new(
+        "添加成员",
+        vec![field("人类显示名", ""), field("AI 显示名", "")],
+        buttons,
+    );
+    let mut msg = String::from(if initial {
+        "AI 可留空；也可跳过两种身份"
+    } else {
+        "可单独添加人类或 AI"
+    });
     loop {
-        let choice =
-            Form::new("队伍设置", vec![], &["新建队伍", "加入已有队伍"]).interact(t, c, "")?;
+        let (human, assistant) = match form.interact(t, color, &msg)? {
+            Action::Back if !initial => return Ok(()),
+            Action::Back => continue,
+            Action::Button(1) => (String::new(), String::new()),
+            Action::Button(_) => (form.val(0), form.val(1)),
+        };
+        match client.request(Request::Register {
+            human,
+            assistant,
+            initial,
+        }) {
+            Ok(_) => return Ok(()),
+            Err(e) => msg = e.to_string(),
+        }
+    }
+}
+fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<()> {
+    let mut menu = Form::new("队伍设置", vec![], &["新建队伍", "加入已有队伍"]);
+    loop {
+        let choice = menu.interact(t, c, "")?;
         match choice {
-            Action::Back => return Ok(false),
+            Action::Back => continue,
             Action::Button(0) => {
-                let labels = [
-                    "GitHub 账户",
-                    "仓库名",
-                    "队员 1",
-                    "队员 2",
-                    "队员 3",
-                    "助手 1",
-                    "助手 2",
-                    "助手 3",
-                    "工作区名称（以逗号分隔）",
-                ];
+                let labels = ["GitHub 账户", "仓库名", "工作区名称（以逗号分隔）"];
                 let mut form = Form::new(
                     "新建队伍",
                     labels.iter().map(|s| field(s, "")).collect(),
@@ -376,24 +409,20 @@ fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<bool> {
                     let owner = form.val(0);
                     let name = form.val(1);
                     let spaces = form
-                        .val(8)
+                        .val(2)
                         .split([',', '，'])
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(String::from)
                         .collect();
-                    let manifest = match NewTeam::from_wizard(
-                        &format!("team-{}", name.replace('.', "-")),
-                        [form.val(2), form.val(3), form.val(4)],
-                        [form.val(5), form.val(6), form.val(7)],
-                        spaces,
-                    ) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            msg = format!("{e:?}");
-                            continue;
-                        }
-                    };
+                    let manifest =
+                        match NewTeam::empty(&format!("team-{}", name.replace('.', "-")), spaces) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                msg = format!("{e:?}");
+                                continue;
+                            }
+                        };
                     let confirm = format!(
                         "确认创建 {owner}/{name}（{}）",
                         if choice == 0 { "私有" } else { "公开" }
@@ -410,7 +439,7 @@ fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<bool> {
                         public: choice == 1,
                         manifest,
                     }) {
-                        Ok(_) => return Ok(true),
+                        Ok(_) => return Ok(()),
                         Err(e) => msg = e.to_string(),
                     }
                 }
@@ -427,7 +456,7 @@ fn setup(t: &mut Term, client: &mut Client, c: ThemeColor) -> io::Result<bool> {
                         break;
                     }
                     match client.request(Request::Join(form.val(0))) {
-                        Ok(_) => return Ok(true),
+                        Ok(_) => return Ok(()),
                         Err(e) => msg = e.to_string(),
                     }
                 }
@@ -580,7 +609,7 @@ fn workspace(
                 Constraint::Length(1),
             ])
             .areas(f.area());
-            let height = usize::from(tree.height.saturating_sub(2));
+            let height = usize::from(tree.height.saturating_sub(1));
             offset = offset.min(names.len().saturating_sub(height));
             let lines = names
                 .iter()
@@ -589,10 +618,7 @@ fn workspace(
                 .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join("\n");
-            f.render_widget(
-                Paragraph::new(lines).block(Block::bordered().title("工作区")),
-                tree,
-            );
+            f.render_widget(Paragraph::new(lines).block(super::page("工作区")), tree);
             let buttons = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(bar);
             for (i, (label, rect)) in ["打开工作目录", "保存工作", "提交工作"]
                 .iter()
@@ -615,16 +641,20 @@ fn workspace(
         let activate = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(()),
-                KeyCode::Tab => {
-                    focus = (focus + 1) % 4;
+                KeyCode::Up if focus == 0 && offset > 0 => {
+                    offset -= 1;
                     false
                 }
-                KeyCode::Up => {
-                    offset = offset.saturating_sub(1);
+                KeyCode::Down
+                    if focus == 0
+                        && offset + usize::from(t.size()?.height.saturating_sub(3))
+                            < names.len() =>
+                {
+                    offset += 1;
                     false
                 }
-                KeyCode::Down => {
-                    offset = offset.saturating_add(1);
+                code if let Some(next) = super::focus_step(code, focus, 4) => {
+                    focus = next;
                     false
                 }
                 KeyCode::Enter => focus > 0,
@@ -765,7 +795,7 @@ fn choose(
         let count = options.len() + 1;
         let mut hits = Vec::new();
         t.draw(|f| {
-            let block = Block::bordered().title(title);
+            let block = super::page(title);
             let inner = block.inner(f.area());
             f.render_widget(block, f.area());
             let start = (focus + 1usize).saturating_sub(usize::from(inner.height));
@@ -798,12 +828,8 @@ fn choose(
         let activate = match input()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(None),
-                KeyCode::Up | KeyCode::BackTab => {
-                    focus = (focus + count - 1) % count;
-                    false
-                }
-                KeyCode::Down | KeyCode::Tab => {
-                    focus = (focus + 1) % count;
+                code if let Some(next) = super::focus_step(code, focus, count) => {
+                    focus = next;
                     false
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => true,

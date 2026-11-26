@@ -185,6 +185,13 @@ pub fn published_letters(
     team: &NewTeam,
     remote: &str,
 ) -> io::Result<Vec<crate::application::letters::PublishedLetter>> {
+    published_snapshot(root, team, remote).map(|(_, letters)| letters)
+}
+pub fn published_snapshot(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+) -> io::Result<(NewTeam, Vec<crate::application::letters::PublishedLetter>)> {
     use crate::application::letters::PublishedLetter;
     #[derive(serde::Deserialize)]
     struct Envelope {
@@ -249,7 +256,7 @@ pub fn published_letters(
             body,
         });
     }
-    Ok(result)
+    Ok((actual, result))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -750,4 +757,67 @@ pub fn workspace_action(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Merge a roster addition into the latest remote manifest. Repeat attempts retain the member IDs.
+pub fn register_members(
+    root: &Path,
+    remote: &str,
+    team: &NewTeam,
+    intent: &InitialCommit,
+    human: &str,
+    assistant: &str,
+) -> io::Result<NewTeam> {
+    use std::fs;
+    team.validate()?;
+    let dir = root
+        .join("teams")
+        .join(team.id())
+        .join("worktrees")
+        .join(format!("registration-{}", intent.operation));
+    fs::create_dir_all(&dir)?;
+    git(&dir, &["init"])?;
+    git(&dir, &["config", "user.name", &intent.actor])?;
+    git(&dir, &["config", "user.email", "synod@localhost"])?;
+    for round in 0..3 {
+        git(
+            &dir,
+            &["fetch", "--no-tags", "--", remote, "refs/heads/main"],
+        )?;
+        git(
+            &dir,
+            &["switch", "--discard-changes", "--detach", "FETCH_HEAD"],
+        )?;
+        let mut actual: NewTeam = serde_json::from_slice(&git(&dir, &["show", "HEAD:team.json"])?)?;
+        actual.validate()?;
+        if actual.id() != team.id() {
+            return Err(io::Error::other("Remote team identity changed"));
+        }
+        let count = actual.roster().len();
+        actual.register(&intent.operation, human, assistant)?;
+        if actual.roster().len() == count {
+            return Ok(actual);
+        }
+        fs::write(dir.join("team.json"), serde_json::to_vec_pretty(&actual)?)?;
+        let q = |s: &str| toml::Value::String(s.into()).to_string();
+        let message = format!(
+            "kind = \"team.configured\"\n\nschema_version = 1\nteam_id = {}\noperation_id = {}\nactor_id = {}\noccurred_at = {}\n",
+            q(team.id()),
+            q(&intent.operation),
+            q(&intent.actor),
+            intent.timestamp
+        );
+        super::commit_message::decode(&message).map_err(|e| io::Error::other(format!("{e:?}")))?;
+        git(&dir, &["add", "--", "team.json"])?;
+        commit(&dir, &message)?;
+        if git(&dir, &["diff", "--name-only", "HEAD^", "HEAD"])?.as_slice() != b"team.json\n" {
+            return Err(io::Error::other("Unexpected registration paths"));
+        }
+        match git(&dir, &["push", "--", remote, "HEAD:refs/heads/main"]) {
+            Ok(_) => return Ok(actual),
+            Err(e) if round == 2 => return Err(e),
+            Err(_) => {}
+        }
+    }
+    Err(io::Error::other("Concurrent roster update; retry"))
 }
