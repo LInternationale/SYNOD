@@ -28,6 +28,9 @@ use std::{
 pub(super) struct Term {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     status: Option<Client>,
+    footer: Rect,
+    footer_focus: bool,
+    theme: ThemeColor,
 }
 impl Term {
     fn clear(&mut self) -> io::Result<()> {
@@ -37,6 +40,7 @@ impl Term {
         &mut self,
         render: impl FnOnce(&mut ratatui::Frame<'_>),
     ) -> io::Result<ratatui::CompletedFrame<'_>> {
+        let (jobs, _, activities) = self.queue()?;
         let status = match &mut self.status {
             Some(client) => match client.request(Request::PublicationStatus)? {
                 Reply::PublicationStatus(state) => match state {
@@ -49,8 +53,26 @@ impl Term {
                 },
                 _ => return Err(io::Error::other("Missing publication status")),
             },
-            None => String::new(),
+            None => "就绪".into(),
         };
+        let status = jobs
+            .iter()
+            .find_map(|j| match j.state {
+                DeliveryState::Running(step) => Some(format!("{} · {}", step_name(step), j.title)),
+                _ => None,
+            })
+            .or_else(|| {
+                activities
+                    .iter()
+                    .find(|a| matches!(a.state, ActivityState::Running))
+                    .map(|a| a.label.clone())
+            })
+            .or_else(|| {
+                jobs.iter()
+                    .find(|j| matches!(j.state, DeliveryState::Waiting))
+                    .map(|j| format!("等待 · {}", j.title))
+            })
+            .unwrap_or(status);
         self.terminal.draw(|f| {
             render(f);
             if !status.is_empty() && !f.area().is_empty() {
@@ -60,12 +82,44 @@ impl Term {
                     .width()
                     .min(usize::from(area.width) / 2)) as u16;
                 let rect = Rect::new(area.right() - width, area.bottom() - 1, width, 1);
+                self.footer = rect;
+                if self.footer_focus {
+                    if !rect.is_empty() {
+                        f.set_cursor_position((rect.x, rect.y));
+                    }
+                    for cell in &mut f.buffer_mut().content {
+                        if cell.bg == self.theme.rgb() {
+                            cell.set_bg(ratatui::style::Color::Reset)
+                                .set_fg(ratatui::style::Color::Reset);
+                        }
+                    }
+                    f.render_widget(
+                        ratatui::widgets::Clear,
+                        Rect::new(area.x, rect.y, area.width, 1),
+                    );
+                    f.render_widget(
+                        Paragraph::new("enter · 查看任务队列"),
+                        Rect::new(area.x, rect.y, area.width - width, 1),
+                    );
+                }
                 f.render_widget(ratatui::widgets::Clear, rect);
-                f.render_widget(Paragraph::new(text).right_aligned(), rect);
+                f.render_widget(
+                    Paragraph::new(text)
+                        .right_aligned()
+                        .style(if self.footer_focus {
+                            self.theme.highlight()
+                        } else {
+                            Default::default()
+                        }),
+                    rect,
+                );
             }
         })
     }
 }
+#[path = "queue_view.rs"]
+mod queue_view;
+use queue_view::{spinner, step_name};
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
@@ -211,7 +265,7 @@ impl<'a> Form<'a> {
                     hint,
                 );
             })?;
-            match input()? {
+            match t.page_input(self.focus + 1 == count, color)? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                     _ if let Some(i) =
                         super::shortcut(k, self.buttons.len(), self.focus < self.fields.len()) =>
@@ -269,7 +323,8 @@ fn notice(t: &mut Term, c: ThemeColor, text: &str) -> io::Result<()> {
             f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
             f.render_widget(Paragraph::new("esc · 返回"), hint);
         })?;
-        if matches!(input()?,Event::Key(k) if k.kind==KeyEventKind::Press && k.code==KeyCode::Esc) {
+        if matches!(t.page_input(true,c)?,Event::Key(k) if k.kind==KeyEventKind::Press && k.code==KeyCode::Esc)
+        {
             break;
         }
     }
@@ -289,6 +344,9 @@ pub fn run(file: &Path) -> io::Result<()> {
     let mut term = Term {
         terminal: Terminal::new(CrosstermBackend::new(io::stdout()))?,
         status: None,
+        footer: Rect::default(),
+        footer_focus: false,
+        theme: ThemeColor::default(),
     };
     match app(&mut term, file) {
         Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
@@ -303,7 +361,11 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             let mut setup = super::directory_setup::DirectorySetup::default();
             loop {
                 let area = t.draw(|frame| setup.render(frame, initial))?.area;
-                match setup.handle(input()?, area, super::native_file::directory) {
+                match setup.handle(
+                    t.page_input(setup.last_action(), initial)?,
+                    area,
+                    super::native_file::directory,
+                ) {
                     super::directory_setup::Action::Stay => {}
 
                     super::directory_setup::Action::Finish(state, work) => {
@@ -339,8 +401,18 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
         else {
             return Err(io::Error::other("Missing local bulletin"));
         };
+        let (queue, _, _) = t.queue()?;
+        let pending: Vec<_> = queue
+            .iter()
+            .filter(|r| r.actor == actor && !published.iter().any(|l| l.id == r.letter))
+            .collect();
         let draft_views: Vec<_> = drafts
             .iter()
+            .filter(|d| {
+                !queue
+                    .iter()
+                    .any(|r| r.actor == actor && r.reference == d.reference)
+            })
             .map(|d| DraftView {
                 reference: &d.reference,
                 title: &d.title,
@@ -348,8 +420,20 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
             .collect();
         let labels: std::collections::HashMap<_, _> = published
             .iter()
-            .filter(|l| l.unread)
-            .map(|l| (&l.id, format!("【未读】{}", l.title)))
+            .map(|l| {
+                (
+                    &l.id,
+                    format!(
+                        "{} {}",
+                        if l.unread && l.author != actor {
+                            "*"
+                        } else {
+                            " "
+                        },
+                        l.title
+                    ),
+                )
+            })
             .collect();
         let views: Vec<_> = published
             .iter()
@@ -371,18 +455,41 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                 &[]
             },
             &views,
-        );
+        )
+        .queued(if filter == [false; 2] { &pending } else { &[] }, spinner());
         let action = loop {
             let area = t.draw(|f| board.render_with_theme(f, &rows, color))?.area;
-            if !event::poll(std::time::Duration::from_secs(2))? {
+            if !event::poll(
+                if pending
+                    .iter()
+                    .any(|r| !matches!(r.state, DeliveryState::Failed(..)))
+                {
+                    std::time::Duration::from_millis(120)
+                } else {
+                    std::time::Duration::from_secs(1)
+                },
+            )? {
                 continue 'refresh;
             }
-            let e = input()?;
+            let e = t.page_input(board.last_action(), color)?;
             if let Some(action) = board.handle(e, area, &rows) {
                 break action;
             }
         };
         match action {
+            BoardAction::Queued(id) => {
+                if let Some(row) = pending.iter().find(|r| r.letter == id)
+                    && matches!(row.state, DeliveryState::Failed(..))
+                {
+                    if let Reply::Draft(d) =
+                        client.request(Request::OpenDraft(row.reference.clone()))?
+                    {
+                        compose(t, &mut client, color, d, &published)?;
+                    }
+                } else {
+                    t.show_queue()?;
+                }
+            }
             BoardAction::Read(id) => {
                 if let Reply::Letter(l) = client.request(Request::Read(id))? {
                     task_detail(t, &mut client, color, &l, &published)?
@@ -708,13 +815,13 @@ fn compose(
                 {
                     continue;
                 }
-                let job = if send {
-                    BackgroundWrite::Send(editing.clone())
+                let request = if send {
+                    Request::EnqueueSend(editing.clone())
                 } else {
-                    BackgroundWrite::Draft(editing.clone())
+                    Request::Background(BackgroundWrite::Draft(editing.clone()))
                 };
-                match client.request(Request::Background(job)) {
-                    Ok(Reply::Committed | Reply::Ready) if send => return Ok(()),
+                match client.request(request) {
+                    Ok(Reply::Queued) if send => return Ok(()),
                     Ok(Reply::DraftCommitted(d)) => {
                         editing = d.clone();
                         saved = d;
@@ -891,7 +998,7 @@ pub(super) fn workspace(
             refresh = true;
             continue;
         }
-        let toggle = match input()? {
+        let toggle = match t.page_input(focus == labels.len(), color)? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 _ if let Some(i) = super::shortcut(k, labels.len(), false) => {
                     focus = i + 1;
@@ -1167,7 +1274,7 @@ fn filter_page(t: &mut Term, color: ThemeColor, filter: &mut [bool; 2]) -> io::R
                 Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
             );
         })?;
-        match input()? {
+        match t.page_input(focus == 2, color)? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc | KeyCode::Enter => return Ok(()),
                 KeyCode::Char(' ') => {}
@@ -1258,7 +1365,7 @@ fn choose(
                 hint,
             );
         })?;
-        match input()? {
+        match t.page_input(focus == options.len(), color)? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(None),
                 KeyCode::F(1) => return Ok(Some(values)),
@@ -1512,7 +1619,14 @@ fn task_detail(
                 footer,
             );
         })?;
-        let submit = match input()? {
+        let submit = match t.page_input(
+            (if ticks.is_empty() {
+                focus == 0
+            } else {
+                focus == ticks.len() + 1
+            }) && scroll == max_scroll,
+            color,
+        )? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Char(' ') if focus >= 2 => {

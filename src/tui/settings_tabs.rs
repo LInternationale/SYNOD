@@ -1,7 +1,7 @@
 //! Preference tabs and in-page editing.
 use super::{
     input_field,
-    live::{Term, input, workspace},
+    live::{Term, workspace},
     preferences::{ThemeColor, ThemeEditor},
 };
 use crate::session::{protocol::*, transport::Client};
@@ -51,7 +51,10 @@ pub(super) fn run(
         return Err(io::Error::other("Missing sync interval"));
     };
     let mut member = [p.human, p.assistant, String::new(), String::new()];
-    let mut interval = [period.to_string()];
+    let Reply::QueuePreferences(limit) = client.request(Request::QueuePreferences)? else {
+        return Err(io::Error::other("Missing queue preference"));
+    };
+    let mut interval = [period.to_string(), limit.to_string()];
     let mut theme = ThemeEditor::new(*color);
     let mut tab = 0usize;
     let mut focus = 0usize;
@@ -81,7 +84,7 @@ pub(super) fn run(
                 &["本机人类", "本机 AI", "新人类显示名", "新 AI 显示名"],
                 &["应用身份", "添加成员"],
             ),
-            1 => (&["同步间隔（秒）"], &["应用设置"]),
+            1 => (&["同步间隔（秒）", "保留已完成任务（行）"], &["应用设置"]),
             _ => (&["R", "G", "B"], &["应用设置"]),
         };
         let values: &mut [String] = match tab {
@@ -149,7 +152,7 @@ pub(super) fn run(
                 hint,
             );
         })?;
-        let apply = match input()? {
+        let apply = match t.page_input(focus + 1 == count, *color)? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc if focus == 0 => return Ok(()),
                 KeyCode::Esc => {
@@ -246,7 +249,14 @@ pub(super) fn run(
             1 => interval[0]
                 .parse()
                 .map_err(|_| io::Error::other("请输入大于零的整数秒数"))
-                .and_then(|seconds| client.request(Request::SetInterval(seconds)).map(|_| ())),
+                .and_then(|seconds| {
+                    let limit = interval[1]
+                        .parse()
+                        .map_err(|_| io::Error::other("请输入非负整数行数"))?;
+                    client
+                        .request(Request::SetRemotePreferences(seconds, limit))
+                        .map(|_| ())
+                }),
             _ => theme
                 .apply(|v| client.request(Request::ApplyTheme(v.0)).map(|_| ()))
                 .map(|_| *color = theme.active())

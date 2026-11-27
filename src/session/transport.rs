@@ -1,4 +1,5 @@
 //! Unix session ownership and JSON line transport.
+use super::protocol::ActivityState;
 use super::{
     bootstrap,
     protocol::{Entry, PublicationState, Reply, Request, VERSION},
@@ -96,6 +97,106 @@ impl Client {
     }
 }
 
+#[derive(Default)]
+struct RemoteTasks {
+    next: u64,
+    items: std::collections::BTreeMap<u64, super::protocol::RemoteActivity>,
+}
+impl RemoteTasks {
+    fn add(&mut self, label: String) -> u64 {
+        self.items.retain(|_, item| {
+            item.label != label || !matches!(item.state, ActivityState::Failed(_))
+        });
+        self.next += 1;
+        self.items.insert(
+            self.next,
+            super::protocol::RemoteActivity {
+                label,
+                state: ActivityState::Waiting,
+            },
+        );
+        self.next
+    }
+}
+struct TrackedTask {
+    tasks: Arc<Mutex<RemoteTasks>>,
+    id: u64,
+}
+impl TrackedTask {
+    fn new(tasks: &Arc<Mutex<RemoteTasks>>, label: String) -> io::Result<Self> {
+        let id = tasks
+            .lock()
+            .map_err(|_| io::Error::other("Queue unavailable"))?
+            .add(label);
+        Ok(Self {
+            tasks: tasks.clone(),
+            id,
+        })
+    }
+    fn start(&self) {
+        if let Ok(mut tasks) = self.tasks.lock()
+            && let Some(item) = tasks.items.get_mut(&self.id)
+        {
+            item.state = ActivityState::Running;
+        }
+    }
+    fn fail(&self, reason: String) {
+        if let Ok(mut tasks) = self.tasks.lock()
+            && let Some(task) = tasks.items.get_mut(&self.id)
+        {
+            task.state = ActivityState::Failed(reason);
+        }
+    }
+    fn outcome(&self, file: &Path, result: &io::Result<Reply>) -> io::Result<()> {
+        match result {
+            Err(e) => self.fail(e.to_string()),
+            Ok(Reply::Saved(_, Some(reason))) => self.fail(reason.clone()),
+            Ok(_) => self.finish(file)?,
+        }
+        Ok(())
+    }
+    fn finish(&self, file: &Path) -> io::Result<()> {
+        let label = self
+            .tasks
+            .lock()
+            .map_err(|_| io::Error::other("Queue unavailable"))?
+            .items
+            .get(&self.id)
+            .map(|item| item.label.clone());
+        if let Some(label) = label {
+            super::host::delivery::remember(file, &[label])?;
+        }
+        Ok(())
+    }
+}
+impl Drop for TrackedTask {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.tasks.lock()
+            && !tasks
+                .items
+                .get(&self.id)
+                .is_some_and(|a| matches!(a.state, ActivityState::Failed(_)))
+        {
+            tasks.items.remove(&self.id);
+        }
+    }
+}
+fn remote_label(request: &Request) -> Option<String> {
+    Some(match request {
+        Request::SaveDraft(d) => format!("保存草稿 · {}", d.title),
+        Request::SendCurrent(d) => format!("寄信 · {}", d.title),
+        Request::Send(_) => "寄信".into(),
+        Request::Task { .. } => "更新信件任务".into(),
+        Request::WorkspaceAction { space, .. } => format!("同步工作 · {space}"),
+        Request::SpaceSync { space, .. } => format!("更新工作区 · {space}"),
+        Request::Register { .. } | Request::Identities { .. } => "更新队伍成员".into(),
+        Request::Create { .. } => "创建队伍".into(),
+        Request::Join(_) => "加入队伍".into(),
+        Request::Published | Request::Drafts => "获取队伍更新".into(),
+        _ => return None,
+    })
+}
+
 fn connection(
     stream: UnixStream,
     file: Arc<PathBuf>,
@@ -104,6 +205,7 @@ fn connection(
     wake: mpsc::Sender<()>,
     sync_error: Arc<Mutex<Option<String>>>,
     publication: Arc<Mutex<PublicationState>>,
+    tasks: Arc<Mutex<RemoteTasks>>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     let entry = match read(&mut reader)? {
@@ -128,6 +230,42 @@ fn connection(
                     | Request::Identities { .. }
             );
             let result = (|| -> io::Result<Reply> {
+                match request {
+                    Request::EnqueueSend(draft) => {
+                        super::host::delivery::enqueue(&file, entry, draft)?;
+                        let _ = wake.send(());
+                        return Ok(Reply::Queued);
+                    }
+                    Request::DeliveryQueue => {
+                        let (rows, recent) = super::host::delivery::snapshot(&file)?;
+                        return Ok(Reply::DeliveryQueue(
+                            rows,
+                            recent,
+                            tasks
+                                .lock()
+                                .map_err(|_| io::Error::other("Queue unavailable"))?
+                                .items
+                                .values()
+                                .cloned()
+                                .collect(),
+                        ));
+                    }
+                    Request::QueuePreferences => {
+                        return Ok(Reply::QueuePreferences(
+                            ClientConfig::read(&file)?.completed_rows,
+                        ));
+                    }
+                    Request::SetRemotePreferences(interval, limit) => {
+                        ClientConfig::update(&file, |c| {
+                            c.sync_interval_seconds = interval;
+                            c.completed_rows = limit;
+                        })?;
+                        super::host::delivery::remember(&file, &[])?;
+                        let _ = wake.send(());
+                        return Ok(Reply::Ready);
+                    }
+                    _ => {}
+                }
                 if matches!(request, Request::PublicationStatus) {
                     let state = publication
                         .lock()
@@ -149,15 +287,19 @@ fn connection(
                     let file = file.clone();
                     let status = publication.clone();
                     let wake = wake.clone();
+                    let request = job.request();
+                    let task =
+                        TrackedTask::new(&tasks, remote_label(&request).unwrap_or_default())?;
                     scope.spawn(move || {
                         let result = (|| {
                             let _guard = lock
                                 .lock()
                                 .map_err(|_| io::Error::other("Writer unavailable"))?;
+                            task.start();
                             let mut receipt = Some(tx.clone());
                             let result = super::host::perform_observed(
                                 &file,
-                                job.request(),
+                                request,
                                 entry,
                                 &mut |reply| {
                                     if let Some(channel) = receipt.take() {
@@ -168,6 +310,7 @@ fn connection(
                                     }
                                 },
                             );
+                            task.outcome(&file, &result)?;
                             if let Ok(mut state) = status.lock() {
                                 *state = match &result {
                                     Err(e) => PublicationState::Failed(e.to_string()),
@@ -213,12 +356,24 @@ fn connection(
                     Request::Close => return Ok(Reply::Ready),
                     _ => {}
                 }
+                let task = remote_label(&request)
+                    .map(|label| TrackedTask::new(&tasks, label))
+                    .transpose()?;
                 let _guard = writer
                     .lock()
                     .map_err(|_| io::Error::other("Settings lock unavailable"))?;
-                match request {
+                if let Some(task) = &task {
+                    task.start();
+                }
+                let reply = match request {
                     Request::ApplyTheme(_) | Request::SetInterval(_) => unreachable!(),
-                    Request::SyncStatus | Request::Background(_) | Request::PublicationStatus => {
+                    Request::QueuePreferences
+                    | Request::SetRemotePreferences(..)
+                    | Request::DeliveryQueue
+                    | Request::EnqueueSend(_)
+                    | Request::SyncStatus
+                    | Request::Background(_)
+                    | Request::PublicationStatus => {
                         unreachable!()
                     }
                     Request::Interval => Ok(Reply::Interval(
@@ -247,7 +402,11 @@ fn connection(
                     | Request::WorkspaceAction { .. }
                     | Request::Workspace) => super::host::perform_as(&file, other, entry),
                     Request::Hello(..) => Err(io::Error::other("Session already connected")),
+                };
+                if let Some(task) = task {
+                    task.outcome(&file, &reply)?;
                 }
+                reply
             })();
             if refresh_team && result.is_ok() {
                 let _ = wake.send(());
@@ -324,12 +483,25 @@ pub fn host(file: PathBuf) -> io::Result<()> {
     let worker_error = sync_error.clone();
     let publication = Arc::new(Mutex::new(PublicationState::Idle));
     let recovery_status = publication.clone();
+    let tasks = Arc::new(Mutex::new(RemoteTasks::default()));
+    let worker_tasks = tasks.clone();
     let sync_worker = thread::spawn(move || {
         loop {
             if let Ok(_guard) = worker_lock.lock() {
+                let task = TrackedTask::new(&worker_tasks, "检查远端更新".into()).ok();
+                if let Some(t) = &task {
+                    t.start();
+                }
                 let error = super::host::synchronize(&worker_file)
                     .err()
                     .map(|e| e.to_string());
+                if let Some(t) = task {
+                    if let Some(reason) = &error {
+                        t.fail(reason.clone());
+                    } else {
+                        let _ = t.finish(&worker_file);
+                    }
+                }
                 if error.is_none()
                     && let Ok(mut state) = recovery_status.lock()
                     && matches!(*state, PublicationState::Failed(_))
@@ -345,7 +517,8 @@ pub fn host(file: PathBuf) -> io::Result<()> {
                 .unwrap_or(Duration::from_secs(30));
             match stop_rx.recv_timeout(wait) {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                _ => {}
+                Ok(()) => while stop_rx.try_recv().is_ok() {},
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
     });
@@ -365,8 +538,18 @@ pub fn host(file: PathBuf) -> io::Result<()> {
                 let error = sync_error.clone();
                 let generation = generation.clone();
                 let publication = publication.clone();
+                let tasks = tasks.clone();
                 workers.push(thread::spawn(move || {
-                    let _ = connection(stream, file, writer, generation, wake, error, publication);
+                    let _ = connection(
+                        stream,
+                        file,
+                        writer,
+                        generation,
+                        wake,
+                        error,
+                        publication,
+                        tasks,
+                    );
                     let _ = done.send(());
                 }));
             }
@@ -435,6 +618,7 @@ mod navigation_tests {
                 wake,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(PublicationState::Idle)),
+                Arc::default(),
             )
         });
         fs::create_dir_all(roots.work.join("local-notes"))?;
@@ -476,6 +660,17 @@ mod navigation_tests {
         assert!(letters.is_empty());
         assert!(
             matches!(client.request(Request::OpenDraft("letter-local-1".into()))?,Reply::Draft(d) if d.body=="offline body")
+        );
+        assert!(matches!(
+            client.request(Request::EnqueueSend(crate::application::letters::Draft {
+                title: "Send while remote is blocked".into(),
+                to: "member-chen".into(),
+                ..Default::default()
+            }))?,
+            Reply::Queued
+        ));
+        assert!(
+            matches!(client.request(Request::DeliveryQueue)?,Reply::DeliveryQueue(rows,_,_) if rows.len()==1 && matches!(rows[0].state,crate::session::protocol::DeliveryState::Waiting))
         );
         client.request(Request::Close)?;
         drop(guard);

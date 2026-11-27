@@ -23,6 +23,7 @@ pub enum BoardAction<'a> {
     OpenDraft(&'a str),
     QuickReply(String),
     Read(String),
+    Queued(String),
     Filter,
 }
 
@@ -88,6 +89,7 @@ fn layout(area: Rect, _reply: bool) -> (Rect, Vec<Rect>) {
 pub struct BoardRows<'a> {
     drafts: &'a [DraftView<'a>],
     rows: Vec<(String, String, &'a str)>,
+    queued: usize,
 }
 
 impl<'a> BoardRows<'a> {
@@ -97,7 +99,7 @@ impl<'a> BoardRows<'a> {
             .map(|d| {
                 (
                     format!("draft:{}", d.reference),
-                    format!("【草稿】{}", d.title),
+                    format!("# {}", d.title),
                     "",
                 )
             })
@@ -107,9 +109,44 @@ impl<'a> BoardRows<'a> {
                     .map(|l| (format!("letter:{}", l.id), l.title.into(), l.body)),
             )
             .collect();
-        Self { drafts, rows }
+        Self {
+            drafts,
+            rows,
+            queued: 0,
+        }
     }
 
+    pub(super) fn queued(
+        mut self,
+        queue: &[&crate::session::protocol::DeliveryRow],
+        spinner: &str,
+    ) -> Self {
+        use crate::session::protocol::DeliveryState;
+        let mut prefix = Vec::new();
+        for job in queue {
+            let key = format!("letter:{}", job.letter);
+            if self.rows.iter().any(|r| r.0 == key) {
+                continue;
+            }
+            prefix.push((
+                key,
+                format!(
+                    "{} {}",
+                    if matches!(job.state, DeliveryState::Failed(..)) {
+                        "!"
+                    } else {
+                        spinner
+                    },
+                    job.title
+                ),
+                "",
+            ));
+        }
+        self.queued = prefix.len();
+        prefix.append(&mut self.rows);
+        self.rows = prefix;
+        self
+    }
     fn views(&self) -> Vec<LetterView<'_>> {
         self.rows
             .iter()
@@ -126,6 +163,9 @@ pub struct Bulletin {
 }
 
 impl Bulletin {
+    pub(super) fn last_action(&self) -> bool {
+        self.focus == Focus::Preferences
+    }
     pub fn return_to_list(&mut self) {
         if let BoardScreen::Detail(id) = &self.screen {
             self.screen = BoardScreen::Board(id.clone());
@@ -171,7 +211,12 @@ impl Bulletin {
             };
             frame.render_widget(widget, area);
         }
+        let pending = self
+            .screen
+            .position(&views)
+            .is_some_and(|index| index < rows.queued);
         let hint = match self.focus {
+            Focus::List if pending => "enter · 查看",
             Focus::List if self.selected_letter().is_some() => "enter · 查看信件    r · 快速回复",
             Focus::List if !views.is_empty() => "enter · 编辑草稿",
             Focus::List => "",
@@ -199,7 +244,13 @@ impl Bulletin {
                         self.focus = BUTTONS[i].0;
                         return self.focus.action(self.selected_letter());
                     }
-                    if self.focus == Focus::List && key.code == KeyCode::Char('r') {
+                    if self.focus == Focus::List
+                        && key.code == KeyCode::Char('r')
+                        && !self
+                            .screen
+                            .position(&views)
+                            .is_some_and(|i| i < rows.queued)
+                    {
                         return self
                             .selected_letter()
                             .map(|id| BoardAction::QuickReply(id.into()));
@@ -223,10 +274,17 @@ impl Bulletin {
                     return self.focus.action(self.selected_letter());
                 } else if self.focus == Focus::List {
                     if key.code == KeyCode::Enter {
+                        if self
+                            .screen
+                            .position(&views)
+                            .is_some_and(|i| i < rows.queued)
+                        {
+                            return Some(BoardAction::Queued(self.selected_letter()?.to_owned()));
+                        }
                         if let Some(draft) = self
                             .screen
                             .position(&views)
-                            .and_then(|i| rows.drafts.get(i))
+                            .and_then(|i| rows.drafts.get(i.checked_sub(rows.queued)?))
                         {
                             return Some(BoardAction::OpenDraft(draft.reference));
                         }

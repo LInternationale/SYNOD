@@ -396,6 +396,11 @@ pub(super) fn perform_observed(
                 return Ok(Reply::Ready);
             }
             if let Request::SaveDraft(mut draft) = request {
+                delivery::editable(
+                    &roots.state.join("teams").join(team.team.id()),
+                    entry.actor(&team),
+                    &draft.reference,
+                )?;
                 let copy = editing_copy(&base, &mut draft)?;
                 let prior =
                     read_optional::<operations::FrozenSend>(&copy.join("save-pending.json"))?;
@@ -405,6 +410,11 @@ pub(super) fn perform_observed(
                 };
                 write_local(&copy.join("save-pending.json"), &intent)?;
                 write_local(&copy.join("editing.json"), &intent.draft)?;
+                delivery::clear_failed(
+                    &roots.state.join("teams").join(team.team.id()),
+                    entry.actor(&team),
+                    &intent.draft.reference,
+                )?;
                 return match finish_cloud_save_observed(
                     &roots.state,
                     &team,
@@ -853,6 +863,13 @@ pub(super) fn cached_query(
         {
             return Err(io::Error::other("Invalid draft reference"));
         }
+        if let Some(draft) = delivery::editable(
+            &roots.state.join("teams").join(p.team.id()),
+            entry.actor(&p),
+            id,
+        )? {
+            return Ok(Some(Reply::Draft(draft)));
+        }
         let copy = roots
             .state
             .join("teams")
@@ -907,6 +924,7 @@ pub(super) fn synchronize(file: &Path) -> io::Result<()> {
     if config.pending_team.is_some() {
         return Ok(());
     }
+    delivery::drain(file, &p)?;
     perform_as(file, Request::Published, Entry::Human)?;
     let roots = bootstrap::configured(file)?.ok_or_else(|| io::Error::other("Setup required"))?;
     let mut result = retry_outbox(&roots.state, &p).and(operations::retry_personal(
@@ -1260,3 +1278,6 @@ mod registration_tests {
         fs::remove_dir_all(root)
     }
 }
+
+#[path = "delivery.rs"]
+pub(super) mod delivery;

@@ -1,5 +1,5 @@
 //! Access to the existing team's manifest without checking out user files.
-use crate::application::setup::NewTeam;
+use crate::application::{letters::DeliveryStep, setup::NewTeam};
 use std::{io, path::Path, process::Command};
 
 pub fn fetch_manifest(repo: &str, cache: &Path) -> io::Result<NewTeam> {
@@ -381,7 +381,7 @@ pub struct FrozenSend {
 }
 
 impl FrozenSend {
-    pub(super) fn letter(&self) -> String {
+    pub(crate) fn letter(&self) -> String {
         self.draft
             .cloud
             .as_ref()
@@ -484,6 +484,17 @@ pub(crate) fn send_letter_observed(
     s: &FrozenSend,
     ready: &mut dyn FnMut(),
 ) -> io::Result<()> {
+    deliver(root, team, remote, s, ready, None)
+}
+
+pub(crate) fn deliver(
+    root: &Path,
+    team: &NewTeam,
+    remote: &str,
+    s: &FrozenSend,
+    ready: &mut dyn FnMut(),
+    mut progress: Option<&mut dyn FnMut(DeliveryStep) -> io::Result<()>>,
+) -> io::Result<()> {
     use std::fs;
     team.validate()?;
     if team.id() != s.team
@@ -512,8 +523,19 @@ pub(crate) fn send_letter_observed(
         &format!("letter_id = \"{letter}\"\nevent_id = \"{event}\""),
     )?;
     for round in 0..3 {
+        if let Some(report) = progress.as_mut() {
+            report(DeliveryStep::Pull)?;
+        }
         let board = published_letters(root, team, remote)?;
         let cache = root.join("teams").join(team.id()).join("repo.git");
+        if board
+            .iter()
+            .any(|l| l.id != letter && l.events.iter().any(|entry| entry.event_id == event))
+        {
+            return Err(io::Error::other(
+                "This delivery was already published with a different draft identity",
+            ));
+        }
         if let Some(existing) = board.iter().find(|l| l.id == letter) {
             if !existing.events.iter().any(|e| {
                 e.kind == "LetterSent"
@@ -587,6 +609,18 @@ pub(crate) fn send_letter_observed(
             ],
         )?;
         let branch = format!("refs/heads/drafts/{}/{letter}/{}", s.actor, draft.copy);
+        let push_branch = || {
+            git(
+                &dir,
+                &["push", "--", remote, &format!("{draft_oid}:{branch}")],
+            )
+        };
+        if let Some(report) = progress.as_mut() {
+            report(DeliveryStep::Push)?;
+            push_branch()?;
+            report(DeliveryStep::Merge)?;
+        }
+
         git(&dir, &["switch", "--detach", base])?;
         git(&dir, &["merge", "--no-ff", "--no-commit", draft_oid])?;
         let changes = git(&dir, &["diff", "--cached", "--name-only", "-z", base])?;
@@ -605,10 +639,9 @@ pub(crate) fn send_letter_observed(
             return Err(io::Error::other("Invalid publication parents"));
         }
         ready();
-        git(
-            &dir,
-            &["push", "--", remote, &format!("{draft_oid}:{branch}")],
-        )?;
+        if progress.is_none() {
+            push_branch()?;
+        }
         match git(&dir, &["push", "--", remote, "HEAD:refs/heads/main"]) {
             Ok(_) => {
                 let confirmed = published_letters(root, team, remote)?;

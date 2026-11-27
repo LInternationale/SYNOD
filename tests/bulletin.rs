@@ -36,7 +36,7 @@ fn draft_precedes_publication_and_buttons_share_actions() -> Result<(), std::con
             .map(|x| buffer[(x, row)].symbol())
             .collect::<String>()
     };
-    assert!(line(2).contains("Private") && line(2).contains("草"));
+    assert!(line(2).starts_with("# Private"));
     assert!(line(3).contains("Published"));
     assert_eq!(
         board.handle(key(KeyCode::Enter), area, &rows),

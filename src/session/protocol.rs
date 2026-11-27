@@ -1,11 +1,15 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 7;
+pub const VERSION: u8 = 8;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Hello(u8, String, Entry),
     SyncStatus,
     PublicationStatus,
+    EnqueueSend(Draft),
+    DeliveryQueue,
+    QueuePreferences,
+    SetRemotePreferences(std::num::NonZeroU32, usize),
     Background(BackgroundWrite),
     Interval,
     SetInterval(std::num::NonZeroU32),
@@ -58,6 +62,9 @@ pub enum Request {
 pub enum Reply {
     SyncStatus(Option<String>),
     PublicationStatus(PublicationState),
+    DeliveryQueue(Vec<DeliveryRow>, Vec<String>, Vec<RemoteActivity>),
+    Queued,
+    QueuePreferences(usize),
     Committed,
     DraftCommitted(Draft),
     Interval(std::num::NonZeroU32),
@@ -183,5 +190,35 @@ pub enum PublicationState {
     Idle,
     Pushing,
     Confirmed,
+    Failed(String),
+}
+
+pub use crate::application::letters::DeliveryStep;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DeliveryState {
+    Waiting,
+    Running(DeliveryStep),
+    Failed(DeliveryStep, String),
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeliveryRow {
+    pub key: String,
+    pub actor: String,
+    pub reference: String,
+    pub title: String,
+    pub letter: String,
+    pub state: DeliveryState,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RemoteActivity {
+    pub label: String,
+    pub state: ActivityState,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ActivityState {
+    Waiting,
+    Running,
     Failed(String),
 }

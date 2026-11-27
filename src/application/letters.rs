@@ -267,3 +267,11 @@ pub fn project_progress(letters: &mut [PublishedLetter]) -> std::io::Result<()> 
     }
     Ok(())
 }
+
+/// Ordered remote operations for a frozen outgoing letter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DeliveryStep {
+    Pull,
+    Push,
+    Merge,
+}

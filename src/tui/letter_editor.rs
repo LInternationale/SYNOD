@@ -1,6 +1,6 @@
 //! Compose viewport and insertion-point navigation.
 use super::{
-    live::{Action, Term, input},
+    live::{Action, Term},
     preferences::ThemeColor,
 };
 use crate::session::protocol::{Draft, LetterRow};
@@ -270,7 +270,7 @@ impl LetterEditor {
             })?;
             let old = self.focus;
             let mut activate = false;
-            match input()? {
+            match t.page_input(self.focus == save + 1, color)? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
                     if let Some(i) = super::shortcut(k, 2, false) {
                         return Ok(Action::Button(5 + i));

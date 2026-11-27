@@ -17,12 +17,17 @@ pub struct ClientConfig {
     pub theme_rgb: [u8; 3],
     #[serde(default = "default_interval")]
     pub sync_interval_seconds: std::num::NonZeroU32,
+    #[serde(default = "default_completed_rows")]
+    pub completed_rows: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_team: Option<crate::application::setup::PendingTeam>,
     #[serde(flatten)]
     pub fields: BTreeMap<String, serde_json::Value>,
 }
 
+fn default_completed_rows() -> usize {
+    10
+}
 fn default_interval() -> std::num::NonZeroU32 {
     std::num::NonZeroU32::new(30).expect("positive default")
 }
@@ -33,6 +38,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             theme_rgb: default_rgb(),
+            completed_rows: default_completed_rows(),
             sync_interval_seconds: default_interval(),
             fields: BTreeMap::new(),
             pending_team: None,

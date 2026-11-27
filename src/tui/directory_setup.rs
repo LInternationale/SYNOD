@@ -36,6 +36,9 @@ fn layout(area: Rect) -> [Rect; 5] {
 }
 
 impl DirectorySetup {
+    pub(super) fn last_action(&self) -> bool {
+        self.focus == 2
+    }
     pub fn render(&self, frame: &mut Frame<'_>, color: ThemeColor) {
         let area = frame.area();
         frame.render_widget(super::page("首次设置", color), area);
