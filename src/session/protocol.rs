@@ -1,6 +1,6 @@
 //! Versioned local requests for the live terminal.
 use serde::{Deserialize, Serialize};
-pub const VERSION: u8 = 8;
+pub const VERSION: u8 = 9;
 #[derive(Serialize, Deserialize)]
 pub enum Request {
     Hello(u8, String, Entry),
@@ -8,6 +8,7 @@ pub enum Request {
     PublicationStatus,
     EnqueueSend(Draft),
     DeliveryQueue,
+    ReadQueued(String),
     QueuePreferences,
     SetRemotePreferences(std::num::NonZeroU32, usize),
     Background(BackgroundWrite),
@@ -76,6 +77,7 @@ pub enum Reply {
         letters: Vec<LetterRow>,
         drafts: Vec<DraftRow>,
     },
+    QueuedLetter(QueuedLetter),
     Draft(Draft),
     Work(WorkResult),
     Pending(bool),
@@ -221,4 +223,23 @@ pub enum ActivityState {
     Waiting,
     Running,
     Failed(String),
+}
+
+/// Read-only projection of the envelope frozen by the delivery queue.
+#[derive(Serialize, Deserialize)]
+pub struct QueuedLetter {
+    pub title: String,
+    pub to: String,
+    pub cc: String,
+    pub body: String,
+    #[serde(default)]
+    pub references: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentName>,
+}
+#[derive(Serialize, Deserialize)]
+pub struct AttachmentName {
+    pub filename: String,
 }

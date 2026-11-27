@@ -274,6 +274,7 @@ fn scroll_gutter(
     offset: usize,
     maximum: usize,
     color: preferences::ThemeColor,
+    focused: bool,
 ) {
     if maximum == 0 || area.is_empty() {
         return;
@@ -281,15 +282,15 @@ fn scroll_gutter(
     let height = usize::from(area.height);
     let thumb = (height * height / (height + maximum)).max(1);
     let top = offset.min(maximum) * (height - thumb) / maximum;
-    let [r, g, b] = color.0;
+
     for row in 0..height {
         let active = (top..top + thumb).contains(&row);
         frame.buffer_mut()[(area.right() - 1, area.y + row as u16)]
             .set_symbol(if active { "┃" } else { "│" })
-            .set_fg(if active {
+            .set_fg(if focused {
                 color.rgb()
             } else {
-                ratatui::style::Color::Rgb(r / 2, g / 2, b / 2)
+                ratatui::style::Color::White
             });
     }
 }
@@ -305,7 +306,7 @@ mod scroll_tests {
         for (offset, max, top, bottom) in [(0, 12, "┃", "│"), (12, 12, "│", "┃"), (0, 0, " ", " ")]
         {
             terminal
-                .draw(|f| scroll_gutter(f, f.area(), offset, max, theme))
+                .draw(|f| scroll_gutter(f, f.area(), offset, max, theme, true))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             assert_eq!(buffer[(7, 0)].symbol(), top);
@@ -314,5 +315,12 @@ mod scroll_tests {
                 assert_eq!(buffer[(7, if offset == 0 { 0 } else { 4 })].fg, theme.rgb());
             }
         }
+        terminal
+            .draw(|f| scroll_gutter(f, f.area(), 0, 12, theme, false))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(7, 0)].fg,
+            ratatui::style::Color::White
+        );
     }
 }

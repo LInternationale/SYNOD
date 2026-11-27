@@ -27,6 +27,8 @@ pub struct Attachment {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PublishedLetter {
+    #[serde(default)]
+    pub attachment_names: Option<Vec<String>>,
     pub id: String,
     pub title: String,
     pub author: String,

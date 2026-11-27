@@ -33,6 +33,9 @@ pub(super) struct Term {
     theme: ThemeColor,
 }
 impl Term {
+    pub(super) fn footer_has_focus(&self) -> bool {
+        self.footer_focus
+    }
     fn clear(&mut self) -> io::Result<()> {
         self.terminal.clear()
     }
@@ -76,7 +79,7 @@ impl Term {
         self.terminal.draw(|f| {
             render(f);
             if !status.is_empty() && !f.area().is_empty() {
-                let text = format!(" 当前状态 · {status}");
+                let text = format!(" {status}");
                 let area = f.area();
                 let width = (ratatui::text::Span::raw(&text)
                     .width()
@@ -487,7 +490,14 @@ fn app(t: &mut Term, file: &Path) -> io::Result<()> {
                         compose(t, &mut client, color, d, &published)?;
                     }
                 } else {
-                    t.show_queue()?;
+                    match client.request(Request::ReadQueued(id)) {
+                        Ok(Reply::QueuedLetter(d)) => {
+                            queued_letter(t, &mut client, color, &d, &actor, &published)?
+                        }
+                        Ok(Reply::Letter(l)) => task_detail(t, &mut client, color, &l, &published)?,
+                        Err(e) => notice(t, color, &e.to_string())?,
+                        _ => return Err(io::Error::other("Missing frozen letter")),
+                    }
                 }
             }
             BoardAction::Read(id) => {
@@ -1448,19 +1458,34 @@ fn task_detail(
             if staged == letter.completed {
                 staged = updated.completed;
             }
+            let mut updated = updated;
+            if updated.attachment_names.is_none() {
+                updated.attachment_names = letter.attachment_names.take();
+            }
             letter = updated;
             awaiting_confirmation = false;
             message.clear();
         }
         let mut bounds = Vec::new();
         let mut max_scroll = 0;
+        let footer_focus = t.footer_has_focus();
+        let body_focus = ticks.len() + 2;
         t.draw(|f| {
             let outer = super::page(&letter.title, color);
             let inner = outer.inner(f.area());
             f.render_widget(outer, f.area());
             let show_progress = !letter.dependencies.is_empty() || !letter.checklist.is_empty();
-            let [addresses, subtasks, progress, viewport, feedback, footer] = Layout::vertical([
+            let [
+                addresses,
+                subtasks,
+                progress,
+                body_label,
+                viewport,
+                feedback,
+                footer,
+            ] = Layout::vertical([
                 Constraint::Length(3),
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(0),
@@ -1468,6 +1493,17 @@ fn task_detail(
                 Constraint::Length(1),
             ])
             .areas(inner);
+            f.render_widget(
+                Paragraph::new("正文    ").style(if focus == body_focus {
+                    color.highlight()
+                } else {
+                    Default::default()
+                }),
+                Rect {
+                    width: body_label.width.min(8),
+                    ..body_label
+                },
+            );
             let body = Rect {
                 width: viewport.width.saturating_sub(1),
                 ..viewport
@@ -1544,6 +1580,20 @@ fn task_detail(
                     lines.push(raw.to_owned().into());
                 }
             }
+            if let Some(names) = &letter.attachment_names
+                && !names.is_empty()
+            {
+                lines.push(ratatui::text::Line::styled(
+                    "─".repeat(usize::from(body.width)),
+                    ratatui::style::Style::default().fg(color.rgb()),
+                ));
+                lines.push("附件".into());
+                lines.extend(
+                    names
+                        .iter()
+                        .map(|name| ratatui::text::Line::raw(name.as_str())),
+                );
+            }
             text.clear();
             if !letter.references.is_empty() {
                 text.push_str("\n\n引用");
@@ -1608,28 +1658,26 @@ fn task_detail(
                 usize::from(scroll),
                 usize::from(max_scroll),
                 color,
+                focus == body_focus && !footer_focus,
             );
+            bounds.push((body_focus, viewport));
+            bounds.push((body_focus, body_label));
             f.render_widget(Paragraph::new(message.as_str()), feedback);
             f.render_widget(
                 Paragraph::new(if focus == 1 {
                     "enter · 设置子任务"
+                } else if focus == body_focus {
+                    "↑↓ · 滚动正文    PgUp/PgDn · 翻页"
                 } else {
                     "space · 切换勾选    enter · 提交    PgUp/PgDn · 滚动正文"
                 }),
                 footer,
             );
         })?;
-        let submit = match t.page_input(
-            (if ticks.is_empty() {
-                focus == 0
-            } else {
-                focus == ticks.len() + 1
-            }) && scroll == max_scroll,
-            color,
-        )? {
+        let submit = match t.page_input(focus == body_focus && scroll == max_scroll, color)? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Esc => return Ok(()),
-                KeyCode::Char(' ') if focus >= 2 => {
+                KeyCode::Char(' ') if (2..body_focus).contains(&focus) => {
                     ticks[focus - 2] = !ticks[focus - 2];
                     false
                 }
@@ -1639,13 +1687,16 @@ fn task_detail(
                     false
                 }
                 KeyCode::PageUp => {
+                    focus = body_focus;
                     scroll = scroll.saturating_sub(5);
                     false
                 }
                 KeyCode::PageDown => {
+                    focus = body_focus;
                     scroll = scroll.saturating_add(5);
                     false
                 }
+                KeyCode::Enter if focus == body_focus => false,
                 KeyCode::Enter => true,
                 KeyCode::Down if focus == 1 => {
                     focus = 0;
@@ -1659,16 +1710,22 @@ fn task_detail(
                     let next = if focus == 0 { 2 } else { focus + 1 };
                     if next < ticks.len() + 2 && bounds.iter().any(|(id, _)| *id == next) {
                         focus = next;
-                    } else if scroll < max_scroll {
-                        scroll += 1;
+                    } else {
+                        focus = body_focus;
+                        scroll = scroll.saturating_add(1).min(max_scroll);
                     }
                     false
                 }
                 KeyCode::Up if focus != 1 => {
+                    if focus == body_focus && scroll > 0 {
+                        scroll -= 1;
+                        continue;
+                    }
                     let prev = focus.saturating_sub(1);
                     if prev >= 2 && bounds.iter().any(|(id, _)| *id == prev) {
                         focus = prev;
                     } else if scroll > 0 {
+                        focus = body_focus;
                         scroll -= 1;
                     } else {
                         focus = 0;
@@ -1676,7 +1733,7 @@ fn task_detail(
                     false
                 }
                 code if let Some(next) =
-                    super::focus_step(code, focus, 2 + ticks.len(), &bounds) =>
+                    super::focus_step(code, focus, body_focus + 1, &bounds) =>
                 {
                     focus = next;
                     reveal = true;
@@ -1690,6 +1747,7 @@ fn task_detail(
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 ) =>
             {
+                focus = body_focus;
                 scroll = if m.kind == MouseEventKind::ScrollUp {
                     scroll.saturating_sub(3)
                 } else {
@@ -1703,7 +1761,9 @@ fn task_detail(
                     .find(|(_, r)| r.contains(Position::new(m.column, m.row)))
                 {
                     focus = *i;
-                    if focus >= 2 {
+                    if focus == body_focus {
+                        false
+                    } else if focus >= 2 {
                         ticks[focus - 2] = !ticks[focus - 2];
                         false
                     } else if focus == 0 {
@@ -1788,6 +1848,116 @@ fn task_detail(
             }
             Err(e) => message = e.to_string(),
             _ => return Err(io::Error::other("Missing task acknowledgement")),
+        }
+    }
+}
+
+/// Inspect the locally frozen message while delivery owns its immutable inputs.
+fn queued_letter(
+    t: &mut Term,
+    client: &mut Client,
+    color: ThemeColor,
+    d: &QueuedLetter,
+    actor: &str,
+    board: &[LetterRow],
+) -> io::Result<()> {
+    let Reply::Team(Some(p)) = client.request(Request::Profile)? else {
+        return Err(io::Error::other("Missing roster"));
+    };
+    let roster = p.team.roster();
+    let titles = board
+        .iter()
+        .map(|r| (r.id.as_str(), r.title.as_str()))
+        .collect::<Vec<_>>();
+    let addresses = format!(
+        "发件人  {}\n收件人  {}\n抄送    {}\n引用    {}\n子任务  {}",
+        super::letter_editor::names(std::iter::once(actor), &roster),
+        super::letter_editor::names(std::iter::once(&d.to), &roster),
+        super::letter_editor::names(d.cc.split(','), &roster),
+        super::letter_editor::names(d.references.iter(), &titles),
+        super::letter_editor::names(d.dependencies.iter(), &titles)
+    );
+    let mut offset = 0u16;
+    loop {
+        let mut maximum = 0;
+        let mut page_height = 1;
+        let focused = !t.footer_has_focus();
+        t.draw(|f| {
+            let header = super::page(&d.title, color);
+            let area = header.inner(f.area());
+            f.render_widget(header, f.area());
+            let [metadata, label, viewport, hint] = Layout::vertical([
+                Constraint::Length(5),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            f.render_widget(Paragraph::new(addresses.as_str()), metadata);
+            f.render_widget(
+                Paragraph::new("正文    ").style(if focused {
+                    color.highlight()
+                } else {
+                    Default::default()
+                }),
+                Rect {
+                    width: label.width.min(8),
+                    ..label
+                },
+            );
+            let body = Rect {
+                width: viewport.width.saturating_sub(1),
+                ..viewport
+            };
+            let mut lines = d
+                .body
+                .split('\n')
+                .map(ratatui::text::Line::raw)
+                .collect::<Vec<_>>();
+            lines.push(ratatui::text::Line::styled(
+                "─".repeat(usize::from(body.width)),
+                ratatui::style::Style::default().fg(color.rgb()),
+            ));
+            lines.push("附件".into());
+            lines.extend(
+                d.attachments
+                    .iter()
+                    .map(|a| ratatui::text::Line::raw(a.filename.as_str())),
+            );
+            let content = Paragraph::new(lines).wrap(Wrap { trim: false });
+            maximum = content
+                .line_count(body.width)
+                .saturating_sub(usize::from(body.height))
+                .min(u16::MAX as usize) as u16;
+            offset = offset.min(maximum);
+            page_height = body.height.max(1);
+            f.render_widget(content.scroll((offset, 0)), body);
+            super::scroll_gutter(
+                f,
+                viewport,
+                usize::from(offset),
+                usize::from(maximum),
+                color,
+                focused,
+            );
+            f.render_widget(Paragraph::new("↑↓ · 滚动正文    esc · 返回"), hint);
+        })?;
+        match t.page_input(offset == maximum, color)? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Esc => return Ok(()),
+                KeyCode::Up => offset = offset.saturating_sub(1),
+                KeyCode::Down => offset = offset.saturating_add(1),
+                KeyCode::PageUp => offset = offset.saturating_sub(page_height),
+                KeyCode::PageDown => offset = offset.saturating_add(page_height),
+                _ => {}
+            },
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => {
+                offset = offset.saturating_add(3)
+            }
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => {
+                offset = offset.saturating_sub(3)
+            }
+            _ => {}
         }
     }
 }

@@ -632,11 +632,15 @@ fn board_reply(
 
     let letters = std::mem::take(letters);
     if let Request::Read(id) = request {
-        return letters
+        let mut letter = letters
             .into_iter()
             .find(|l| l.id == id)
-            .map(Reply::Letter)
-            .ok_or_else(|| io::Error::other("Unknown published letter"));
+            .ok_or_else(|| io::Error::other("Unknown published letter"))?;
+        if letter.attachment_names.is_none() {
+            letter.attachment_names =
+                Some(operations::cached_attachment_names(state, &team.team, &id)?);
+        }
+        return Ok(Reply::Letter(letter));
     }
     Ok(Reply::Published(letters))
 }

@@ -236,6 +236,9 @@ fn connection(
                         let _ = wake.send(());
                         return Ok(Reply::Queued);
                     }
+                    Request::ReadQueued(id) => {
+                        return super::host::delivery::read_queued(&file, entry, &id);
+                    }
                     Request::DeliveryQueue => {
                         let (rows, recent) = super::host::delivery::snapshot(&file)?;
                         return Ok(Reply::DeliveryQueue(
@@ -369,6 +372,7 @@ fn connection(
                     Request::ApplyTheme(_) | Request::SetInterval(_) => unreachable!(),
                     Request::QueuePreferences
                     | Request::SetRemotePreferences(..)
+                    | Request::ReadQueued(_)
                     | Request::DeliveryQueue
                     | Request::EnqueueSend(_)
                     | Request::SyncStatus

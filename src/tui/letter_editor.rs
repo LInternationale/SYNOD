@@ -104,6 +104,7 @@ impl LetterEditor {
             let mut max_offset = 0;
             let mut lines = Vec::new();
             let mut cursor_row = 0;
+            let footer_focus = t.footer_has_focus();
             t.draw(|f| {
                 let header = super::page("写信", color);
                 let area = header.inner(f.area());
@@ -168,7 +169,7 @@ impl LetterEditor {
                     .partition_point(|line| line.start <= self.caret)
                     .saturating_sub(1);
                 page = usize::from(view.height.max(1));
-                let attachment_y = 5 + lines.len();
+                let attachment_y = 6 + lines.len();
                 end_body = attachment_y.saturating_sub(page);
                 max_offset = (attachment_y + 1 + d.attachments.len()).saturating_sub(page);
                 if self.editing {
@@ -182,7 +183,14 @@ impl LetterEditor {
                     self.offset = self.offset.min(y).max((y + 1).saturating_sub(page));
                 }
                 self.offset = self.offset.min(max_offset);
-                super::scroll_gutter(f, viewport, self.offset, max_offset, color);
+                super::scroll_gutter(
+                    f,
+                    viewport,
+                    self.offset,
+                    max_offset,
+                    color,
+                    self.focus == 5 && !self.editing && !footer_focus,
+                );
                 let rect = |y: usize| {
                     (y >= self.offset && y < self.offset + usize::from(view.height)).then(|| {
                         Rect::new(view.x, view.y + (y - self.offset) as u16, view.width, 1)
@@ -222,6 +230,13 @@ impl LetterEditor {
                             f.set_cursor_position((x, r.y));
                         }
                     }
+                }
+                if let Some(r) = rect(attachment_y - 1) {
+                    f.render_widget(
+                        Paragraph::new("─".repeat(r.width as usize))
+                            .style(Style::default().fg(color.rgb())),
+                        r,
+                    );
                 }
                 if let Some(r) = rect(attachment_y) {
                     f.render_widget(

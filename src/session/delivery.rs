@@ -121,6 +121,7 @@ pub(in crate::session) fn snapshot(file: &Path) -> io::Result<(Vec<DeliveryRow>,
     let dir = team_root(file, &p)?.join("deliveries");
     let mut completed =
         read_optional::<Vec<Completed>>(&dir.join("completed.json"))?.unwrap_or_default();
+    fold_automatic_checks(&mut completed);
     completed.truncate(ClientConfig::read(file)?.completed_rows);
     Ok((
         rows(&dir)?,
@@ -256,6 +257,11 @@ struct Completed {
     key: Option<String>,
     label: String,
 }
+fn fold_automatic_checks(recent: &mut Vec<Completed>) {
+    recent.dedup_by(|a, b| {
+        a.key.is_none() && b.key.is_none() && a.label == "检查远端更新" && a.label == b.label
+    });
+}
 fn remember_steps(file: &Path, row: &DeliveryRow, steps: &[DeliveryStep]) -> io::Result<()> {
     let records = steps
         .iter()
@@ -306,6 +312,7 @@ fn store_completed(file: &Path, records: Vec<Completed>) -> io::Result<()> {
         }
         recent.insert(0, record);
     }
+    fold_automatic_checks(&mut recent);
     recent.truncate(ClientConfig::read(file)?.completed_rows);
     write_local(&path, &recent)
 }
@@ -343,6 +350,23 @@ mod tests {
         assert_eq!(waiting.len(), 1);
         assert!(matches!(waiting[0].state, DeliveryState::Waiting));
         let reference = &waiting[0].reference;
+        assert!(
+            matches!(read_queued(&file,Entry::Human,&waiting[0].letter)?,Reply::QueuedLetter(d) if d.body=="original")
+        );
+        let automatic = "检查远端更新".to_string();
+        for label in [
+            &automatic,
+            &automatic,
+            &"手动更新".to_string(),
+            &automatic,
+            &automatic,
+        ] {
+            remember(&file, std::slice::from_ref(label))?;
+        }
+        assert_eq!(
+            snapshot(&file)?.1,
+            ["检查远端更新", "手动更新", "检查远端更新"]
+        );
         drain(&file, &p)?;
         assert!(matches!(
             snapshot(&file)?.0[0].state,
@@ -387,7 +411,7 @@ mod tests {
         let (remaining, recent) = snapshot(&file)?;
         assert!(remaining.is_empty());
         assert_eq!(
-            recent,
+            &recent[..3],
             [
                 "merge · First title",
                 "push · First title",
@@ -401,4 +425,29 @@ mod tests {
         assert_eq!(snapshot(&file)?.1.len(), 1);
         fs::remove_dir_all(root)
     }
+}
+
+pub(in crate::session) fn read_queued(
+    file: &Path,
+    entry: Entry,
+    letter: &str,
+) -> io::Result<Reply> {
+    #[derive(serde::Deserialize)]
+    struct FrozenPreview {
+        draft: QueuedLetter,
+    }
+    let p =
+        profile(&ClientConfig::read(file)?)?.ok_or_else(|| io::Error::other("Team required"))?;
+    let dir = team_root(file, &p)?.join("deliveries");
+    if entry.bound(&p)
+        && let Some(row) = rows(&dir)?
+            .into_iter()
+            .find(|r| r.actor == entry.actor(&p) && r.letter == letter)
+        && let Some(intent) =
+            read_optional::<FrozenPreview>(&dir.join(row.key).join("intent.json"))?
+    {
+        return Ok(Reply::QueuedLetter(intent.draft));
+    }
+    cached_query(file, &Request::Read(letter.into()), entry)?
+        .ok_or_else(|| io::Error::other("Letter unavailable"))
 }

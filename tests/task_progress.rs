@@ -1,6 +1,7 @@
 use synod::application::letters::{PublishedLetter, project_progress};
 fn node(id: &str, children: &[&str]) -> PublishedLetter {
     PublishedLetter {
+        attachment_names: Some(Vec::new()),
         id: id.into(),
         title: id.into(),
         author: String::new(),

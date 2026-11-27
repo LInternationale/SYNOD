@@ -214,6 +214,45 @@ pub(crate) fn cached_board(
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct EnvelopeAssets {
+    #[serde(default)]
+    attachments: Vec<AssetName>,
+}
+#[derive(serde::Deserialize)]
+struct AssetName {
+    filename: String,
+}
+impl EnvelopeAssets {
+    fn names(self) -> Vec<String> {
+        self.attachments
+            .into_iter()
+            .map(|asset| asset.filename)
+            .collect()
+    }
+}
+pub(crate) fn cached_attachment_names(
+    state: &Path,
+    team: &NewTeam,
+    id: &str,
+) -> io::Result<Vec<String>> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(io::Error::other("Invalid letter ID"));
+    }
+    let cache = state.join("teams").join(team.id()).join("repo.git");
+    let data = git(
+        &cache,
+        &[
+            "show",
+            &format!("refs/synod/verified-main:letters/{id}/envelope.json"),
+        ],
+    )?;
+    Ok(serde_json::from_slice::<EnvelopeAssets>(&data)?.names())
+}
 pub fn published_snapshot(
     root: &Path,
     team: &NewTeam,
@@ -222,6 +261,8 @@ pub fn published_snapshot(
     use crate::application::letters::PublishedLetter;
     #[derive(serde::Deserialize)]
     struct Envelope {
+        #[serde(flatten)]
+        assets: EnvelopeAssets,
         letter_id: String,
         title: String,
         from: String,
@@ -334,6 +375,7 @@ pub fn published_snapshot(
             }
         }
         result.push(PublishedLetter {
+            attachment_names: Some(env.assets.names()),
             checklist,
             events: facts,
             to: env.to,

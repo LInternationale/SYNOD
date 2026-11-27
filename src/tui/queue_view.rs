@@ -123,7 +123,7 @@ impl Term {
                     }
                 )
             }));
-            lines.extend(completed.into_iter().map(|s| format!("完成  {s}")));
+            lines.extend(completed.into_iter().map(|s| format!("✓  {s}")));
             if lines.is_empty() {
                 lines.push("队列为空".into());
             }
